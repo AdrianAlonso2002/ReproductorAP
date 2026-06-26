@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="es">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Reproductor AP</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="shortcut icon" href="assets/reprod.png" type="image/x-icon">
+  <link rel="apple-touch-icon" href="assets/reprod.png">
+  <link rel="manifest" href="manifest.json">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css?v=8" />
+</head>
+
+<body>
+  <div class="ambient" aria-hidden="true">
+    <canvas id="sparkCanvas"></canvas>
+    <div class="color-orbit color-orbit-a"></div>
+    <div class="color-orbit color-orbit-b"></div>
+    <div class="noise"></div>
+  </div>
+
+  <main class="app-shell">
+    <aside class="library-panel" aria-label="Todas las canciones">
+      <div class="panel-heading">
+        <span>Biblioteca</span>
+        <strong id="songCount">0</strong>
+      </div>
+      <div id="libraryList" class="library-list"></div>
+    </aside>
+
+    <section class="player-stage" aria-label="Reproductor principal">
+      <div class="top-bar">
+        <div>
+          <p class="eyebrow">Reproductor</p>
+          <h1>Reproductor AP</h1>
+        </div>
+      </div>
+
+      <div class="visual-area">
+        <canvas id="leftWave" class="wave-canvas" aria-hidden="true"></canvas>
+        <div class="cover-wrap">
+          <img id="coverArt" src="assets/default-cover.png" alt="Portada de la cancion" />
+          <div class="cover-shine" aria-hidden="true"></div>
+        </div>
+        <canvas id="rightWave" class="wave-canvas" aria-hidden="true"></canvas>
+      </div>
+
+      <div class="track-meta">
+        <p id="artistName">Aura System</p>
+        <h2 id="trackTitle">Midnight Bloom</h2>
+      </div>
+
+      <section class="transport" aria-label="Controles de reproduccion">
+        <div class="progress-row">
+          <span id="currentTime">0:00</span>
+          <input id="seekBar" type="range" min="0" max="1000" value="0" aria-label="Progreso" />
+          <span id="durationTime">0:00</span>
+        </div>
+        <div class="control-row">
+          <button class="round-button" id="previousButton" type="button" title="Anterior">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="m19 20-10-8 10-8z" />
+              <path d="M5 19V5" />
+            </svg>
+          </button>
+          <button class="play-button" id="playButton" type="button" title="Play">
+            <svg id="playIcon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M8 5v14l11-7z" />
+            </svg>
+            <svg id="pauseIcon" class="hidden" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M8 5v14" />
+              <path d="M16 5v14" />
+            </svg>
+          </button>
+          <button class="round-button" id="nextButton" type="button" title="Siguiente">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="m5 4 10 8-10 8z" />
+              <path d="M19 5v14" />
+            </svg>
+          </button>
+        </div>
+        <div class="sub-controls">
+          <button id="shuffleButton" class="text-toggle" type="button">Shuffle</button>
+
+          <div class="volume-control" aria-label="Volumen">
+            <button id="muteButton" class="mute-button" type="button" title="Silenciar" aria-label="Silenciar"
+              aria-pressed="false">
+              <svg id="volumeOnIcon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M11 5 6 9H3v6h3l5 4z" />
+                <path d="M15 9a5 5 0 0 1 0 6" />
+                <path d="M18 7a9 9 0 0 1 0 10" />
+              </svg>
+              <svg id="volumeOffIcon" class="hidden" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M11 5 6 9H3v6h3l5 4z" />
+                <path d="m16 9 5 5" />
+                <path d="m21 9-5 5" />
+              </svg>
+            </button>
+
+            <input id="volumeSlider" type="range" min="0" max="1" step="0.01" value="0.82" aria-label="Volumen" />
+          </div>
+        </div>
+        <p id="statusText" class="status-text" role="status"></p>
+      </section>
+    </section>
+
+    <aside class="detail-panel" aria-label="Informacion de la cancion">
+      <div class="panel-heading">
+        <span>Ficha</span>
+      </div>
+      <div class="song-detail">
+        <div class="detail-cover">
+          <img id="detailCover" src="assets/default-cover.png" alt="" />
+        </div>
+        <p class="detail-kicker" id="detailArtist">Aura System</p>
+        <h2 id="detailTitle">Midnight Bloom</h2>
+
+        <dl class="detail-list">
+          <div>
+            <dt>Fecha:</dt>
+            <dd id="detailDate">Sin fecha</dd>
+          </div>
+          <div>
+            <dt>Álbum:</dt>
+            <dd id="detailAlbum">Sin álbum</dd>
+          </div>
+          <div>
+            <dt>Descripción Larga:</dt>
+            <dd id="detailDescription">Selecciona una cancion para ver su descripcion.</dd>
+          </div>
+          <div>
+            <dt>Letra:</dt>
+            <dd id="detailLyrics">Sin letra.</dd>
+          </div>
+        </dl>
+      </div>
+    </aside>
+  </main>
+
+  <audio id="audioElement" preload="metadata"></audio>
+  <script src="tracks.js?v=8"></script>
+  <script src="script.js?v=8"></script>
+</body>
+
+</html>

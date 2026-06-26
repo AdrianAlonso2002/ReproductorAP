@@ -1,0 +1,13 @@
+{
+    "name": "ReproductorAP",
+    "short_name": "ReproductorAP",
+    "start_url": "https://adrianalonso2002.github.io/ReproductorAP/",
+    "display": "standalone",
+    "icons": [
+      {
+        "src": "assets/reprod.png",
+        "sizes": "192x192",
+        "type": "image/png"
+      }
+    ]
+  }
