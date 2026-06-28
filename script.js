@@ -42,11 +42,13 @@ let shuffle = false;
 let hasUserSelectedTrack = false;
 let audioContext;
 let mediaSource;
+let mediaStreamSource;
 let analyser;
 let masterGain;
 let dataArray;
 let audioGraphConnected = false;
 let mediaSourceConnected = false;
+let passiveAnalysisConnected = false;
 let isMuted = false;
 let lastVolume = 0.82;
 let visualPulse = 0;
@@ -67,6 +69,7 @@ updateMuteIcon();
 
 function boot() {
   elements.count.textContent = playlist.length;
+  setupMediaSession();
   renderLibrary();
   loadTrack(0, false);
   hydrateAllTrackMetadata();
@@ -199,6 +202,7 @@ function renderDetails(track) {
   elements.detailAlbum.textContent = track.album;
   elements.detailDescription.textContent = track.description;
   elements.detailLyrics.textContent = track.lyrics;
+  updateMediaSession(track);
 }
 
 async function playCurrent() {
@@ -287,13 +291,32 @@ async function ensureAudioGraph(isDemo) {
     await audioContext.resume();
   }
 
-  if (!audioGraphConnected) {
-    analyser.connect(masterGain);
-    masterGain.connect(audioContext.destination);
-    audioGraphConnected = true;
+  if (isDemo) {
+    connectAnalyserToOutput();
+    syncOutputVolume();
+    return;
   }
 
-  if (!isDemo && !mediaSourceConnected) {
+  if (!mediaSourceConnected && !passiveAnalysisConnected) {
+    const captureStream = elements.audio.captureStream || elements.audio.mozCaptureStream;
+
+    if (captureStream) {
+      const stream = captureStream.call(elements.audio);
+
+      if (stream && stream.getAudioTracks().length) {
+        mediaStreamSource = audioContext.createMediaStreamSource(stream);
+        mediaStreamSource.connect(analyser);
+        passiveAnalysisConnected = true;
+        return;
+      }
+    }
+
+    if (isMobilePlaybackSensitive()) {
+      throw new Error("Analisis real desactivado para conservar audio de fondo");
+    }
+
+    connectAnalyserToOutput();
+
     if (!mediaSource) {
       mediaSource = audioContext.createMediaElementSource(elements.audio);
     }
@@ -303,6 +326,19 @@ async function ensureAudioGraph(isDemo) {
   }
 
   syncOutputVolume();
+}
+
+function connectAnalyserToOutput() {
+  if (audioGraphConnected) return;
+
+  analyser.connect(masterGain);
+  masterGain.connect(audioContext.destination);
+  audioGraphConnected = true;
+}
+
+function isMobilePlaybackSensitive() {
+  return /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)
+    || (navigator.maxTouchPoints > 1 && Math.min(window.innerWidth, window.innerHeight) < 940);
 }
 
 function startDemo() {
@@ -364,15 +400,36 @@ function updatePlayState(nextState) {
   elements.playIcon.classList.toggle("hidden", isPlaying);
   elements.pauseIcon.classList.toggle("hidden", !isPlaying);
   elements.play.title = isPlaying ? "Pausa" : "Play";
+
+  if ("mediaSession" in navigator) {
+    try {
+      navigator.mediaSession.playbackState = isPlaying ? "playing" : "paused";
+    } catch {
+      // Playback state is optional in some browsers.
+    }
+  }
 }
 
-function nextTrack() {
-  const nextIndex = shuffle ? Math.floor(Math.random() * playlist.length) : currentIndex + 1;
-  loadTrack(nextIndex, isPlaying);
+function nextTrack(autoplay = isPlaying) {
+  const shouldAutoplay = typeof autoplay === "boolean" ? autoplay : isPlaying;
+  loadTrack(getNextIndex(), shouldAutoplay);
 }
 
-function previousTrack() {
-  loadTrack(currentIndex - 1, isPlaying);
+function previousTrack(autoplay = isPlaying) {
+  const shouldAutoplay = typeof autoplay === "boolean" ? autoplay : isPlaying;
+  loadTrack(currentIndex - 1, shouldAutoplay);
+}
+
+function getNextIndex() {
+  if (!playlist.length) return 0;
+  if (!shuffle || playlist.length === 1) return currentIndex + 1;
+
+  let nextIndex = currentIndex;
+  while (nextIndex === currentIndex) {
+    nextIndex = Math.floor(Math.random() * playlist.length);
+  }
+
+  return nextIndex;
 }
 
 function wrapIndex(index) {
@@ -434,7 +491,7 @@ async function hydrateTrackMetadata(index) {
       artist: metadata.artist || metadata.albumArtist || playlist[index].artist,
       album: metadata.album || playlist[index].album,
       date: metadata.date || playlist[index].date,
-      cover: metadata.cover || playlist[index].cover
+      cover: hasCustomCover(playlist[index].cover) ? playlist[index].cover : metadata.cover || playlist[index].cover
     };
 
     metadataCache.set(track.src, "done");
@@ -446,11 +503,16 @@ async function hydrateTrackMetadata(index) {
       elements.artist.textContent = updatedTrack.artist;
       elements.cover.src = updatedTrack.cover;
       renderDetails(updatedTrack);
+      updateMediaSession(updatedTrack);
       extractPalette(updatedTrack.cover, updatedTrack.color);
     }
   } catch {
     metadataCache.delete(track.src);
   }
+}
+
+function hasCustomCover(cover) {
+  return Boolean(cover && cover !== defaultCover);
 }
 
 function waitForIdle() {
@@ -846,7 +908,7 @@ function updateDemoClock() {
   elements.durationTime.textContent = formatTime(duration);
 
   if (time >= duration) {
-    nextTrack();
+    nextTrack(true);
   }
 }
 
@@ -993,6 +1055,71 @@ function syncOutputVolume() {
   updateMuteIcon();
 }
 
+function setupMediaSession() {
+  if (!("mediaSession" in navigator)) return;
+
+  try {
+    navigator.mediaSession.setActionHandler("play", () => playCurrent().catch(handlePlayError));
+    navigator.mediaSession.setActionHandler("pause", pauseCurrent);
+    navigator.mediaSession.setActionHandler("previoustrack", () => previousTrack(true));
+    navigator.mediaSession.setActionHandler("nexttrack", () => nextTrack(true));
+    navigator.mediaSession.setActionHandler("seekto", (details) => {
+      if (!Number.isFinite(details.seekTime) || getTrack().demo) return;
+      elements.audio.currentTime = details.seekTime;
+      updateRealClock(true);
+      updateMediaPosition();
+    });
+  } catch {
+    // Some browsers expose Media Session partially.
+  }
+}
+
+function updateMediaSession(track) {
+  if (!("mediaSession" in navigator)) return;
+
+  try {
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: track.title,
+      artist: track.artist,
+      album: track.album,
+      artwork: [
+        {
+          src: new URL(track.cover || defaultCover, window.location.href).href,
+          sizes: "512x512",
+          type: getArtworkType(track.cover)
+        }
+      ]
+    });
+    updateMediaPosition();
+  } catch {
+    // Metadata is optional; playback must keep working.
+  }
+}
+
+function updateMediaPosition() {
+  if (!("mediaSession" in navigator) || typeof navigator.mediaSession.setPositionState !== "function") return;
+
+  const track = getTrack();
+  if (track.demo || !Number.isFinite(elements.audio.duration) || elements.audio.duration <= 0) return;
+
+  try {
+    navigator.mediaSession.setPositionState({
+      duration: elements.audio.duration,
+      playbackRate: elements.audio.playbackRate || 1,
+      position: Math.min(elements.audio.currentTime || 0, elements.audio.duration)
+    });
+  } catch {
+    // Position state is best-effort.
+  }
+}
+
+function getArtworkType(src) {
+  const clean = String(src || "").split("?")[0].toLowerCase();
+  if (clean.endsWith(".png")) return "image/png";
+  if (clean.endsWith(".webp")) return "image/webp";
+  return "image/jpeg";
+}
+
 function toggleMute() {
   isMuted = !isMuted;
 
@@ -1050,7 +1177,7 @@ elements.play.addEventListener("click", () => {
 });
 
 elements.previous.addEventListener("click", previousTrack);
-elements.next.addEventListener("click", nextTrack);
+elements.next.addEventListener("click", () => nextTrack(isPlaying));
 
 elements.library.addEventListener("click", (event) => {
   const card = event.target.closest(".song-card");
@@ -1066,16 +1193,18 @@ elements.audio.addEventListener("pause", () => {
   if (!getTrack().demo) updatePlayState(false);
 });
 
-elements.audio.addEventListener("ended", nextTrack);
+elements.audio.addEventListener("ended", () => nextTrack(true));
 
 elements.audio.addEventListener("loadedmetadata", () => {
   elements.durationTime.textContent = formatTime(elements.audio.duration);
+  updateMediaPosition();
 });
 
 elements.audio.addEventListener("timeupdate", () => {
   if (isSeeking || getTrack().demo) return;
 
   updateRealClock(true);
+  updateMediaPosition();
 });
 
 elements.audio.addEventListener("error", () => {
