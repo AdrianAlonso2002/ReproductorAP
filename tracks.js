@@ -85,14 +85,14 @@
     },
     {
         "title":  "San Juan",
-        "artist":  "Adriss-RelsB",
+        "artist":  "Adriss-Ozuna",
         "cover":  "",
         "src":  "",
         "color":  "",
         "nuevo":  true,
         "date":  "2026",
         "album":  "Alto Mando",
-        "description":  `En Progreso...`,
+        "description":  `Terminada...`,
         "lyrics":  ``
     },
     {
