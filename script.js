@@ -58,8 +58,22 @@ let demoPausedAt = 0;
 let visualOnlyDemo = false;
 let lastPointerToggleAt = 0;
 let lastRenderedSecond = -1;
+
+// ---- Rendimiento / batería ----------------------------------------------
+let lastDrawTime = 0;
+let lastSparkTime = 0;
+let lastAnalyserTime = 0;
+let animationActive = true;
+const DRAW_INTERVAL_PLAYING = 33;    // ~30 fps
+const DRAW_INTERVAL_PAUSED = 140;    // ~7 fps (visual vivo pero barato)
+const SPARK_INTERVAL_PLAYING = 55;   // ~18 fps
+const SPARK_INTERVAL_PAUSED = 200;   // ~5 fps
+const ANALYSER_INTERVAL = 60;        // muestreo ~16 fps
+// Tamaños de canvas cacheados (evita getBoundingClientRect cada frame)
+const canvasSizes = new WeakMap();
+
 const metadataCache = new Map();
-const sparkles = Array.from({ length: 48 }, () => createSparkle());
+const sparkles = Array.from({ length: 22 }, () => createSparkle());
 
 lastVolume = getVolumeValue() || 0.82;
 elements.audio.volume = lastVolume;
@@ -67,16 +81,93 @@ elements.audio.muted = false;
 setupVolumeIconFallback();
 updateMuteIcon();
 
+// -------------------------------------------------------------------------
+// Arranque
+// -------------------------------------------------------------------------
 function boot() {
   elements.count.textContent = playlist.length;
   setupMediaSession();
   renderLibrary();
   loadTrack(0, false);
   hydrateAllTrackMetadata();
-  draw();
-  drawSparkles();
+  document.addEventListener("visibilitychange", handleVisibilityChange);
+  window.addEventListener("pagehide", () => { animationActive = false; });
+  window.addEventListener("pageshow", () => { animationActive = true; });
+  requestAnimationFrame(draw);
+  requestAnimationFrame(drawSparkles);
 }
 
+function handleVisibilityChange() {
+  if (document.hidden) {
+    animationActive = false;
+  } else {
+    animationActive = true;
+    // Reiniciar relojes para que no salte el throttle al volver
+    lastDrawTime = 0;
+    lastSparkTime = 0;
+  }
+}
+
+// -------------------------------------------------------------------------
+// Media Session (iOS / Android lock screen)
+// -------------------------------------------------------------------------
+function safeSetHandler(action, handler) {
+  if (!("mediaSession" in navigator)) return false;
+  try {
+    navigator.mediaSession.setActionHandler(action, handler);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function setupMediaSession() {
+  if (!("mediaSession" in navigator)) return;
+
+  // Cada handler va por separado para que un fallo no bloquee el resto.
+  safeSetHandler("play", () => playCurrent().catch(handlePlayError));
+  safeSetHandler("pause", pauseCurrent);
+  safeSetHandler("stop", pauseCurrent);
+  safeSetHandler("previoustrack", () => previousTrack(true));
+  safeSetHandler("nexttrack", () => nextTrack(true));
+
+  safeSetHandler("seekto", (details) => {
+    if (!Number.isFinite(details.seekTime) || getTrack().demo) return;
+    elements.audio.currentTime = details.seekTime;
+    updateRealClock(true);
+    updateMediaPosition();
+  });
+
+  // MUY IMPORTANTE: al registrar seekbackward/seekforward como null,
+  // iOS deja de mostrar los botones de ±10s y muestra next/prev.
+  safeSetHandler("seekbackward", null);
+  safeSetHandler("seekforward", null);
+
+  // Un pequeño empujón: iOS también respeta estos si están definidos.
+  safeSetHandler("skipad", null);
+}
+
+/**
+ * iOS "olvida" los handlers cuando cambia el src del <audio>.
+ * Los volvemos a registrar cada vez que cargamos una pista.
+ */
+function refreshMediaSessionHandlers() {
+  if (!("mediaSession" in navigator)) return;
+  safeSetHandler("play", () => playCurrent().catch(handlePlayError));
+  safeSetHandler("pause", pauseCurrent);
+  safeSetHandler("previoustrack", () => previousTrack(true));
+  safeSetHandler("nexttrack", () => nextTrack(true));
+  safeSetHandler("seekto", (details) => {
+    if (!Number.isFinite(details.seekTime) || getTrack().demo) return;
+    elements.audio.currentTime = details.seekTime;
+    updateRealClock(true);
+    updateMediaPosition();
+  });
+}
+
+// -------------------------------------------------------------------------
+// Normalización / biblioteca
+// -------------------------------------------------------------------------
 function normalizeTrack(track, index) {
   return {
     id: `${track.title || "track"}-${track.artist || "artist"}-${index}`,
@@ -108,7 +199,7 @@ function renderLibrary() {
     button.type = "button";
     button.dataset.index = index;
     button.innerHTML = `
-      <img src="${track.cover}" alt="" onerror="this.src='${defaultCover}'" />
+      <img src="${track.cover}" alt="" loading="lazy" decoding="async" onerror="this.src='${defaultCover}'" />
       <span class="song-card-copy">
         <span class="song-card-title">
           <strong>${escapeHtml(track.title)}</strong>
@@ -137,6 +228,9 @@ function updateLibraryCard(index) {
   if (artist) artist.textContent = track.artist;
 }
 
+// -------------------------------------------------------------------------
+// Carga / reproducción
+// -------------------------------------------------------------------------
 function selectTrack(index, autoplay) {
   hasUserSelectedTrack = true;
 
@@ -154,8 +248,14 @@ function loadTrack(index, autoplay) {
 
   stopDemo();
   elements.audio.pause();
-  elements.audio.removeAttribute("src");
-  elements.audio.load();
+
+  // No borramos src: asignar uno nuevo ya limpia el buffer.
+  if (track.demo) {
+    elements.audio.removeAttribute("src");
+    elements.audio.load();
+  } else {
+    elements.audio.src = track.src;
+  }
 
   elements.title.textContent = track.title;
   elements.artist.textContent = track.artist;
@@ -177,12 +277,11 @@ function loadTrack(index, autoplay) {
   setActiveCards();
   renderDetails(track);
 
-  if (!track.demo) {
-    elements.audio.src = track.src;
-  }
-
   extractPalette(track.cover, track.color);
   hydrateTrackMetadata(currentIndex);
+
+  // CRUCIAL para iOS: re-registrar handlers tras cada cambio de pista.
+  refreshMediaSessionHandlers();
 
   if (autoplay) {
     playCurrent().catch(handlePlayError);
@@ -234,6 +333,9 @@ async function playCurrent() {
     updatePlayState(true);
     elements.status.textContent = "";
 
+    // Volver a colocar los handlers justo después de arrancar el audio.
+    refreshMediaSessionHandlers();
+
     try {
       await ensureAudioGraph(false);
     } catch {
@@ -259,6 +361,9 @@ function pauseCurrent() {
   updatePlayState(false);
 }
 
+// -------------------------------------------------------------------------
+// Audio Graph (solo para análisis real, no imprescindible)
+// -------------------------------------------------------------------------
 async function ensureAudioGraph(isDemo) {
   const AudioCtx = window.AudioContext || window.webkitAudioContext;
 
@@ -266,14 +371,14 @@ async function ensureAudioGraph(isDemo) {
     throw new Error("AudioContext no disponible");
   }
 
-  /*
-    Si abres el proyecto como archivo local tipo file:///,
-    el navegador puede bloquear el análisis real del audio.
-    En ese caso dejamos que el audio se escuche normal
-    y las ondas se moverán en modo visual.
-  */
   if (!isDemo && window.location.protocol === "file:") {
     throw new Error("AudioContext bloqueado en file://");
+  }
+
+  // En móvil preferimos no crear siquiera el AudioContext: ahorra batería
+  // y evita problemas de audio en segundo plano.
+  if (!isDemo && isMobilePlaybackSensitive()) {
+    throw new Error("Análisis real desactivado en móvil");
   }
 
   if (!audioContext) {
@@ -311,10 +416,6 @@ async function ensureAudioGraph(isDemo) {
       }
     }
 
-    if (isMobilePlaybackSensitive()) {
-      throw new Error("Analisis real desactivado para conservar audio de fondo");
-    }
-
     connectAnalyserToOutput();
 
     if (!mediaSource) {
@@ -341,6 +442,9 @@ function isMobilePlaybackSensitive() {
     || (navigator.maxTouchPoints > 1 && Math.min(window.innerWidth, window.innerHeight) < 940);
 }
 
+// -------------------------------------------------------------------------
+// Demo (osciladores)
+// -------------------------------------------------------------------------
 function startDemo() {
   stopDemo();
 
@@ -395,6 +499,9 @@ function stopDemo(resetTime = true) {
   }
 }
 
+// -------------------------------------------------------------------------
+// Estado / controles
+// -------------------------------------------------------------------------
 function updatePlayState(nextState) {
   isPlaying = nextState;
   elements.playIcon.classList.toggle("hidden", isPlaying);
@@ -405,7 +512,7 @@ function updatePlayState(nextState) {
     try {
       navigator.mediaSession.playbackState = isPlaying ? "playing" : "paused";
     } catch {
-      // Playback state is optional in some browsers.
+      // opcional en algunos navegadores
     }
   }
 }
@@ -433,26 +540,29 @@ function getNextIndex() {
 }
 
 function wrapIndex(index) {
-  if (!playlist.length) {
-    return 0;
-  }
-
+  if (!playlist.length) return 0;
   return (index + playlist.length) % playlist.length;
 }
 
 function setActiveCards() {
+  // Más barato: no iterar si no hay biblioteca visible
+  if (!elements.library.children.length) return;
   document.querySelectorAll(".song-card").forEach((card) => {
     card.classList.toggle("is-active", Number(card.dataset.index) === currentIndex);
   });
 }
 
+// -------------------------------------------------------------------------
+// Hidratación de metadatos (con arreglo de orden)
+// -------------------------------------------------------------------------
 async function hydrateAllTrackMetadata() {
-  const selectedSrc = getTrack().src;
-
   for (let index = 0; index < playlist.length; index += 1) {
     await waitForIdle();
     await hydrateTrackMetadata(index);
   }
+
+  // FIX raza: capturamos la canción ACTUAL justo antes de reordenar.
+  const currentSrc = playlist[currentIndex]?.src;
 
   playlist.sort((a, b) => getDateScore(b) - getDateScore(a));
   renderLibrary();
@@ -462,9 +572,13 @@ async function hydrateAllTrackMetadata() {
     return;
   }
 
-  const sortedIndex = Math.max(0, playlist.findIndex((track) => track.src === selectedSrc));
-  currentIndex = sortedIndex;
-  setActiveCards();
+  if (currentSrc) {
+    const newIndex = playlist.findIndex((track) => track.src === currentSrc);
+    if (newIndex >= 0) {
+      currentIndex = newIndex;
+      setActiveCards();
+    }
+  }
 }
 
 async function hydrateTrackMetadata(index) {
@@ -521,7 +635,6 @@ function waitForIdle() {
       window.requestIdleCallback(resolve, { timeout: 300 });
       return;
     }
-
     window.setTimeout(resolve, 16);
   });
 }
@@ -540,6 +653,9 @@ function getDateScore(track) {
   return year * 10000 + month * 100 + day;
 }
 
+// -------------------------------------------------------------------------
+// ID3 (lectura por rangos, sin descargar el mp3 completo)
+// -------------------------------------------------------------------------
 async function readId3Metadata(src) {
   const headerResponse = await fetch(src, { headers: { Range: "bytes=0-9" } });
 
@@ -713,6 +829,9 @@ function readUint32(bytes, offset) {
     | bytes[offset + 3];
 }
 
+// -------------------------------------------------------------------------
+// Paleta / acento
+// -------------------------------------------------------------------------
 function applyAccent(hex) {
   const primary = hexToRgb(hex) || [216, 167, 255];
   const secondary = rotateColor(primary);
@@ -726,30 +845,26 @@ function applyAccent(hex) {
 function extractPalette(src, fallback) {
   const image = new Image();
   image.crossOrigin = "anonymous";
+  image.decoding = "async";
 
   image.onload = () => {
     try {
       const canvas = document.createElement("canvas");
       const context = canvas.getContext("2d", { willReadFrequently: true });
-      const size = 40;
+      const size = 24; // más pequeño = menos CPU
 
       canvas.width = size;
       canvas.height = size;
       context.drawImage(image, 0, 0, size, size);
 
       const pixels = context.getImageData(0, 0, size, size).data;
-      let r = 0;
-      let g = 0;
-      let b = 0;
-      let samples = 0;
+      let r = 0, g = 0, b = 0, samples = 0;
 
       for (let i = 0; i < pixels.length; i += 16) {
         const alpha = pixels[i + 3];
-
         if (alpha < 120) continue;
 
         const brightness = (pixels[i] + pixels[i + 1] + pixels[i + 2]) / 3;
-
         if (brightness < 18 || brightness > 238) continue;
 
         r += pixels[i];
@@ -770,13 +885,29 @@ function extractPalette(src, fallback) {
   image.src = src;
 }
 
-function draw() {
+// -------------------------------------------------------------------------
+// Visualización (con throttling)
+// -------------------------------------------------------------------------
+function draw(now) {
   requestAnimationFrame(draw);
+  if (!animationActive) return;
 
-  if (analyser && dataArray) {
+  const interval = isPlaying ? DRAW_INTERVAL_PLAYING : DRAW_INTERVAL_PAUSED;
+  if (now - lastDrawTime < interval) return;
+  lastDrawTime = now;
+
+  if (isPlaying && analyser && dataArray && now - lastAnalyserTime > ANALYSER_INTERVAL) {
+    lastAnalyserTime = now;
     analyser.getByteFrequencyData(dataArray);
 
-    const average = dataArray.reduce((sum, value) => sum + value, 0) / dataArray.length / 255;
+    // Submuestreamos el array para no recorrerlo entero.
+    let sum = 0;
+    let count = 0;
+    for (let i = 0; i < dataArray.length; i += 4) {
+      sum += dataArray[i];
+      count += 1;
+    }
+    const average = count ? sum / count / 255 : 0;
     visualPulse = visualPulse * 0.84 + average * 0.16;
   }
 
@@ -786,33 +917,42 @@ function draw() {
   updateDemoClock();
 }
 
-function drawWave(canvas, mirror) {
-  const context = canvas.getContext("2d");
+function getCanvasSize(canvas) {
   const rect = canvas.getBoundingClientRect();
   const scale = window.devicePixelRatio || 1;
+  const w = Math.floor(rect.width * scale);
+  const h = Math.floor(rect.height * scale);
 
-  if (
-    canvas.width !== Math.floor(rect.width * scale)
-    || canvas.height !== Math.floor(rect.height * scale)
-  ) {
-    canvas.width = Math.floor(rect.width * scale);
-    canvas.height = Math.floor(rect.height * scale);
+  const cached = canvasSizes.get(canvas);
+  if (!cached || cached.w !== w || cached.h !== h) {
+    canvas.width = w;
+    canvas.height = h;
+    canvasSizes.set(canvas, { w, h });
   }
+  return canvas;
+}
 
-  context.clearRect(0, 0, canvas.width, canvas.height);
+function drawWave(canvas, mirror) {
+  const context = canvas.getContext("2d");
+  const w = canvas.width;
+  const h = canvas.height;
 
-  const bars = 36;
-  const centerX = mirror ? canvas.width * 0.9 : canvas.width * 0.1;
-  const gap = canvas.height / bars;
-  const maxWidth = canvas.width * 0.82;
+  context.clearRect(0, 0, w, h);
+
+  const bars = 26; // antes 36 → menos trabajo
+  const centerX = mirror ? w * 0.9 : w * 0.1;
+  const gap = h / bars;
+  const maxWidth = w * 0.82;
   const active = isPlaying;
   const time = performance.now() / 720;
 
+  const accentRgb = getCssRgb("--accent-rgb");
+  const accent2Rgb = getCssRgb("--accent-two-rgb");
+
   for (let i = 0; i < bars; i += 1) {
-    const dataIndex = Math.min(
-      dataArray ? dataArray.length - 1 : 0,
-      Math.floor((i / bars) ** 1.55 * (dataArray ? dataArray.length : 1))
-    );
+    const dataIndex = dataArray
+      ? Math.min(dataArray.length - 1, Math.floor((i / bars) ** 1.55 * dataArray.length))
+      : 0;
 
     const fakePulse = 0.32 + Math.sin(time * 1.8 + i * 0.58) * 0.16;
 
@@ -822,38 +962,41 @@ function drawWave(canvas, mirror) {
         ? fakePulse
         : 0.22 + Math.sin(time + i * 0.58) * 0.08;
 
-    const width = Math.max(10 * scale, maxWidth * (0.1 + dataValue * 0.9));
-    const height = Math.max(3 * scale, gap * 0.36);
+    const barWidth = Math.max(8, maxWidth * (0.1 + dataValue * 0.9));
+    const barHeight = Math.max(2, gap * 0.36);
     const y = i * gap + gap * 0.32;
-    const x = mirror ? centerX - width : centerX;
-    const gradient = context.createLinearGradient(x, y, x + width, y);
+    const x = mirror ? centerX - barWidth : centerX;
 
-    gradient.addColorStop(0, `rgba(${getCssRgb("--accent-rgb")}, ${active ? 0.9 : 0.28})`);
-    gradient.addColorStop(1, `rgba(${getCssRgb("--accent-two-rgb")}, ${active ? 0.34 : 0.12})`);
-
-    context.fillStyle = gradient;
-    roundedRect(context, x, y, width, height, 999 * scale);
+    context.fillStyle = `rgba(${mirror ? accent2Rgb : accentRgb}, ${active ? 0.85 : 0.28})`;
+    roundedRect(context, x, y, barWidth, barHeight, 999);
     context.fill();
   }
 }
 
-function drawSparkles() {
+function drawSparkles(now) {
   requestAnimationFrame(drawSparkles);
+  if (!animationActive) return;
+
+  const interval = isPlaying ? SPARK_INTERVAL_PLAYING : SPARK_INTERVAL_PAUSED;
+  if (now - lastSparkTime < interval) return;
+  lastSparkTime = now;
 
   const canvas = elements.spark;
-  const context = canvas.getContext("2d");
-  const rect = canvas.getBoundingClientRect();
-  const scale = window.devicePixelRatio || 1;
+  const w = canvas.width;
+  const h = canvas.height;
 
-  if (
-    canvas.width !== Math.floor(rect.width * scale)
-    || canvas.height !== Math.floor(rect.height * scale)
-  ) {
+  if (!w || !h) {
+    const rect = canvas.getBoundingClientRect();
+    const scale = window.devicePixelRatio || 1;
     canvas.width = Math.floor(rect.width * scale);
     canvas.height = Math.floor(rect.height * scale);
+    return;
   }
 
-  context.clearRect(0, 0, canvas.width, canvas.height);
+  const context = canvas.getContext("2d");
+  context.clearRect(0, 0, w, h);
+
+  const accentRgb = getCssRgb("--accent-rgb");
 
   sparkles.forEach((sparkle) => {
     sparkle.x += sparkle.speedX;
@@ -861,37 +1004,40 @@ function drawSparkles() {
     sparkle.life += sparkle.speedLife;
 
     if (
-      sparkle.x < -20
-      || sparkle.x > canvas.width + 20
-      || sparkle.y < -20
-      || sparkle.y > canvas.height + 20
+      sparkle.x < -20 || sparkle.x > w + 20 ||
+      sparkle.y < -20 || sparkle.y > h + 20
     ) {
-      Object.assign(sparkle, createSparkle(canvas.width, canvas.height));
+      Object.assign(sparkle, createSparkle(w, h));
     }
 
     const opacity = 0.16 + Math.abs(Math.sin(sparkle.life)) * 0.42;
 
     context.beginPath();
-    context.arc(sparkle.x, sparkle.y, sparkle.radius * scale, 0, Math.PI * 2);
-    context.fillStyle = `rgba(${getCssRgb("--accent-rgb")}, ${opacity})`;
+    context.arc(sparkle.x, sparkle.y, sparkle.radius, 0, Math.PI * 2);
+    context.fillStyle = `rgba(${accentRgb}, ${opacity})`;
     context.fill();
   });
 }
 
-function createSparkle(width = window.innerWidth, height = window.innerHeight) {
-  const scale = window.devicePixelRatio || 1;
+function createSparkle(width, height) {
+  // Si nos pasan dimensiones 0 (canvas aún sin layout), usamos fallback.
+  const w = width || window.innerWidth;
+  const h = height || window.innerHeight;
 
   return {
-    x: Math.random() * width * scale,
-    y: Math.random() * height * scale,
-    radius: 0.7 + Math.random() * 2.3,
-    speedX: (-0.18 + Math.random() * 0.36) * scale,
-    speedY: (-0.22 - Math.random() * 0.26) * scale,
+    x: Math.random() * w,
+    y: Math.random() * h,
+    radius: 0.6 + Math.random() * 1.8,
+    speedX: (-0.15 + Math.random() * 0.3),
+    speedY: (-0.18 - Math.random() * 0.22),
     life: Math.random() * Math.PI * 2,
-    speedLife: 0.015 + Math.random() * 0.03
+    speedLife: 0.012 + Math.random() * 0.025
   };
 }
 
+// -------------------------------------------------------------------------
+// Relojes
+// -------------------------------------------------------------------------
 function updateDemoClock() {
   const track = getTrack();
 
@@ -958,9 +1104,7 @@ function roundedRect(context, x, y, width, height, radius) {
 }
 
 function formatTime(seconds) {
-  if (!Number.isFinite(seconds)) {
-    return "0:00";
-  }
+  if (!Number.isFinite(seconds)) return "0:00";
 
   const mins = Math.floor(seconds / 60);
   const secs = Math.floor(seconds % 60).toString().padStart(2, "0");
@@ -968,12 +1112,12 @@ function formatTime(seconds) {
   return `${mins}:${secs}`;
 }
 
+// -------------------------------------------------------------------------
+// Color helpers
+// -------------------------------------------------------------------------
 function hexToRgb(hex) {
   const clean = String(hex).trim().replace("#", "");
-
-  if (!/^[a-f\d]{6}$/i.test(clean)) {
-    return null;
-  }
+  if (!/^[a-f\d]{6}$/i.test(clean)) return null;
 
   return [
     parseInt(clean.slice(0, 2), 16),
@@ -1010,6 +1154,9 @@ function escapeHtml(value) {
   })[char]);
 }
 
+// -------------------------------------------------------------------------
+// Volumen / mute
+// -------------------------------------------------------------------------
 function setupVolumeIconFallback() {
   if (!elements.volumeIconFallback || elements.mute) return;
 
@@ -1027,7 +1174,6 @@ function setupVolumeIconFallback() {
 
   elements.volumeIconFallback.addEventListener("keydown", (event) => {
     if (event.key !== "Enter" && event.key !== " ") return;
-
     event.preventDefault();
     toggleMute();
   });
@@ -1035,9 +1181,7 @@ function setupVolumeIconFallback() {
 
 function getVolumeValue() {
   const value = Number(elements.volume?.value);
-
   if (!Number.isFinite(value)) return 0.82;
-
   return Math.max(0, Math.min(1, value));
 }
 
@@ -1053,71 +1197,6 @@ function syncOutputVolume() {
   }
 
   updateMuteIcon();
-}
-
-function setupMediaSession() {
-  if (!("mediaSession" in navigator)) return;
-
-  try {
-    navigator.mediaSession.setActionHandler("play", () => playCurrent().catch(handlePlayError));
-    navigator.mediaSession.setActionHandler("pause", pauseCurrent);
-    navigator.mediaSession.setActionHandler("previoustrack", () => previousTrack(true));
-    navigator.mediaSession.setActionHandler("nexttrack", () => nextTrack(true));
-    navigator.mediaSession.setActionHandler("seekto", (details) => {
-      if (!Number.isFinite(details.seekTime) || getTrack().demo) return;
-      elements.audio.currentTime = details.seekTime;
-      updateRealClock(true);
-      updateMediaPosition();
-    });
-  } catch {
-    // Some browsers expose Media Session partially.
-  }
-}
-
-function updateMediaSession(track) {
-  if (!("mediaSession" in navigator)) return;
-
-  try {
-    navigator.mediaSession.metadata = new MediaMetadata({
-      title: track.title,
-      artist: track.artist,
-      album: track.album,
-      artwork: [
-        {
-          src: new URL(track.cover || defaultCover, window.location.href).href,
-          sizes: "512x512",
-          type: getArtworkType(track.cover)
-        }
-      ]
-    });
-    updateMediaPosition();
-  } catch {
-    // Metadata is optional; playback must keep working.
-  }
-}
-
-function updateMediaPosition() {
-  if (!("mediaSession" in navigator) || typeof navigator.mediaSession.setPositionState !== "function") return;
-
-  const track = getTrack();
-  if (track.demo || !Number.isFinite(elements.audio.duration) || elements.audio.duration <= 0) return;
-
-  try {
-    navigator.mediaSession.setPositionState({
-      duration: elements.audio.duration,
-      playbackRate: elements.audio.playbackRate || 1,
-      position: Math.min(elements.audio.currentTime || 0, elements.audio.duration)
-    });
-  } catch {
-    // Position state is best-effort.
-  }
-}
-
-function getArtworkType(src) {
-  const clean = String(src || "").split("?")[0].toLowerCase();
-  if (clean.endsWith(".png")) return "image/png";
-  if (clean.endsWith(".webp")) return "image/webp";
-  return "image/jpeg";
 }
 
 function toggleMute() {
@@ -1152,6 +1231,65 @@ function updateMuteIcon() {
   }
 }
 
+// -------------------------------------------------------------------------
+// Media Session metadata / position
+// -------------------------------------------------------------------------
+function updateMediaSession(track) {
+  if (!("mediaSession" in navigator)) return;
+
+  try {
+    // Varias tallas mejoran la compatibilidad con iOS y Android Auto.
+    const artUrl = new URL(track.cover || defaultCover, window.location.href).href;
+    const artType = getArtworkType(track.cover);
+    const artwork = [
+      { src: artUrl, sizes: "96x96", type: artType },
+      { src: artUrl, sizes: "128x128", type: artType },
+      { src: artUrl, sizes: "192x192", type: artType },
+      { src: artUrl, sizes: "256x256", type: artType },
+      { src: artUrl, sizes: "384x384", type: artType },
+      { src: artUrl, sizes: "512x512", type: artType }
+    ];
+
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: track.title,
+      artist: track.artist,
+      album: track.album,
+      artwork
+    });
+
+    updateMediaPosition();
+  } catch {
+    // opcional
+  }
+}
+
+function updateMediaPosition() {
+  if (!("mediaSession" in navigator) || typeof navigator.mediaSession.setPositionState !== "function") return;
+
+  const track = getTrack();
+  if (track.demo || !Number.isFinite(elements.audio.duration) || elements.audio.duration <= 0) return;
+
+  try {
+    navigator.mediaSession.setPositionState({
+      duration: elements.audio.duration,
+      playbackRate: elements.audio.playbackRate || 1,
+      position: Math.min(elements.audio.currentTime || 0, elements.audio.duration)
+    });
+  } catch {
+    // best-effort
+  }
+}
+
+function getArtworkType(src) {
+  const clean = String(src || "").split("?")[0].toLowerCase();
+  if (clean.endsWith(".png")) return "image/png";
+  if (clean.endsWith(".webp")) return "image/webp";
+  return "image/jpeg";
+}
+
+// -------------------------------------------------------------------------
+// Interacción / eventos
+// -------------------------------------------------------------------------
 function togglePlay() {
   if (isPlaying) {
     pauseCurrent();
@@ -1169,21 +1307,16 @@ elements.play.addEventListener("pointerup", () => {
 });
 
 elements.play.addEventListener("click", () => {
-  if (performance.now() - lastPointerToggleAt < 350) {
-    return;
-  }
-
+  if (performance.now() - lastPointerToggleAt < 350) return;
   togglePlay();
 });
 
-elements.previous.addEventListener("click", previousTrack);
-elements.next.addEventListener("click", () => nextTrack(isPlaying));
+elements.previous.addEventListener("click", () => previousTrack(true));
+elements.next.addEventListener("click", () => nextTrack(true));
 
 elements.library.addEventListener("click", (event) => {
   const card = event.target.closest(".song-card");
-
   if (!card) return;
-
   selectTrack(Number(card.dataset.index), true);
 });
 
@@ -1202,7 +1335,6 @@ elements.audio.addEventListener("loadedmetadata", () => {
 
 elements.audio.addEventListener("timeupdate", () => {
   if (isSeeking || getTrack().demo) return;
-
   updateRealClock(true);
   updateMediaPosition();
 });
@@ -1258,13 +1390,12 @@ elements.volume.addEventListener("input", () => {
   syncOutputVolume();
 });
 
-elements.mute?.addEventListener("click", () => {
-  toggleMute();
-});
+elements.mute?.addEventListener("click", () => toggleMute());
 
 elements.shuffle.addEventListener("click", () => {
   shuffle = !shuffle;
   elements.shuffle.classList.toggle("is-active", shuffle);
 });
 
+// Arrancar
 boot();

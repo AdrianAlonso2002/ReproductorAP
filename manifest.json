@@ -1,13 +1,13 @@
 {
-    "name": "ReproductorAP",
-    "short_name": "ReproductorAP",
-    "start_url": "https://adrianalonso2002.github.io/ReproductorAP/",
-    "display": "standalone",
-    "icons": [
-      {
-        "src": "assets/reprod.png",
-        "sizes": "192x192",
-        "type": "image/png"
-      }
-    ]
-  }
+  "name": "ReproductorAP",
+  "short_name": "ReproductorAP",
+  "start_url": "https://adrianalonso2002.github.io/ReproductorAP/",
+  "display": "standalone",
+  "background_color": "#07050c",
+  "theme_color": "#07050c",
+  "orientation": "portrait",
+  "icons": [
+    { "src": "assets/reprod.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "assets/reprod.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}
