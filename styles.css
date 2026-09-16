@@ -12,9 +12,7 @@
   --shadow: 0 30px 90px rgba(0, 0, 0, 0.44);
 }
 
-* {
-  box-sizing: border-box;
-}
+* { box-sizing: border-box; }
 
 html {
   min-height: 100%;
@@ -28,12 +26,12 @@ body {
   color: var(--text);
   font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   letter-spacing: 0;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
 }
 
-button,
-input {
-  font: inherit;
-}
+button, input { font: inherit; }
 
 button {
   border: 0;
@@ -52,6 +50,9 @@ svg {
   stroke-width: 2;
 }
 
+/* ------------------------------------------------------------------ */
+/* Fondo ambiental                                                     */
+/* ------------------------------------------------------------------ */
 .ambient {
   position: fixed;
   inset: 0;
@@ -68,20 +69,15 @@ svg {
   position: absolute;
   inset: -20%;
   background:
-    conic-gradient(from 120deg at 50% 50%, rgba(var(--accent-rgb), 0.18), transparent, rgba(var(--accent-two-rgb), 0.16), transparent, rgba(255, 255, 255, 0.08)),
+    conic-gradient(from 120deg at 50% 50%,
+      rgba(var(--accent-rgb), 0.18), transparent,
+      rgba(var(--accent-two-rgb), 0.16), transparent,
+      rgba(255, 255, 255, 0.08)),
     radial-gradient(circle at 52% 48%, transparent 0 20%, rgba(255, 255, 255, 0.08) 31%, transparent 48%);
   filter: blur(42px) saturate(1.45);
   animation: drift 24s ease-in-out infinite alternate;
   opacity: 0.82;
-}
-
-#sparkCanvas {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  mix-blend-mode: screen;
-  opacity: 0.7;
+  will-change: transform;
 }
 
 .color-orbit {
@@ -92,6 +88,7 @@ svg {
   filter: blur(56px);
   opacity: 0.2;
   animation: floatPulse 15s ease-in-out infinite;
+  will-change: transform;
 }
 
 .color-orbit-a {
@@ -110,12 +107,64 @@ svg {
 .noise {
   position: absolute;
   inset: 0;
-  background-image: linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px), linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
   background-size: 54px 54px;
   mask-image: radial-gradient(circle at center, black, transparent 78%);
+  -webkit-mask-image: radial-gradient(circle at center, black, transparent 78%);
   opacity: 0.22;
 }
 
+/* Pausar animaciones de fondo cuando NO está reproduciendo
+   (en pausa = no se gasta GPU, y el usuario nota la diferencia) */
+body:not(.is-playing) .ambient::after,
+body:not(.is-playing) .color-orbit,
+body:not(.is-playing) .cover-shine {
+  animation-play-state: paused;
+}
+
+/* ------------------------------------------------------------------ */
+/* Sparkles con CSS puro (antes eran canvas)                           */
+/* ------------------------------------------------------------------ */
+.spark-field {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  mix-blend-mode: screen;
+  opacity: 0.65;
+  contain: strict;
+}
+
+.spark-field span {
+  position: absolute;
+  left: var(--x);
+  bottom: -10px;
+  width: var(--s);
+  height: var(--s);
+  border-radius: 50%;
+  background: rgb(var(--accent-rgb));
+  box-shadow: 0 0 6px rgba(var(--accent-rgb), 0.55);
+  animation: floatUp var(--d) linear infinite;
+  animation-play-state: paused;
+  will-change: transform;
+}
+
+body.is-playing .spark-field span {
+  animation-play-state: running;
+}
+
+@keyframes floatUp {
+  0%   { transform: translate3d(0, 0, 0);       opacity: 0; }
+  10%  { opacity: 0.9; }
+  90%  { opacity: 0.35; }
+  100% { transform: translate3d(0, -100vh, 0);  opacity: 0; }
+}
+
+/* ------------------------------------------------------------------ */
+/* Layout principal                                                    */
+/* ------------------------------------------------------------------ */
 .app-shell {
   display: grid;
   grid-template-columns: minmax(230px, 310px) minmax(0, 1fr) minmax(270px, 360px);
@@ -124,15 +173,23 @@ svg {
   height: 100vh;
   margin: 0 auto;
   padding: clamp(16px, 2.2vw, 24px) 0;
+  padding-top: max(clamp(16px, 2.2vw, 24px), env(safe-area-inset-top));
+  padding-bottom: max(clamp(16px, 2.2vw, 24px), env(safe-area-inset-bottom));
 }
 
 .library-panel,
 .detail-panel,
 .player-stage {
   border: 1px solid var(--line);
-  background: var(--surface);
   box-shadow: var(--shadow);
+  /* Solo el player mantiene backdrop-filter (caro en iOS) */
+  background: rgba(14, 10, 22, 0.86);
+}
+
+.player-stage {
+  background: var(--surface);
   backdrop-filter: blur(26px);
+  -webkit-backdrop-filter: blur(26px);
 }
 
 .library-panel,
@@ -142,15 +199,8 @@ svg {
   overflow: hidden;
 }
 
-.library-panel {
-  border-radius: 22px;
-  padding: 18px;
-}
-
-.detail-panel {
-  border-radius: 22px;
-  padding: 18px;
-}
+.library-panel { border-radius: 22px; padding: 18px; }
+.detail-panel  { border-radius: 22px; padding: 18px; }
 
 .player-stage {
   display: flex;
@@ -199,11 +249,7 @@ svg {
   text-transform: uppercase;
 }
 
-h1,
-h2,
-p {
-  margin: 0;
-}
+h1, h2, p { margin: 0; }
 
 h1 {
   font-size: clamp(1.6rem, 3.4vw, 2.8rem);
@@ -226,13 +272,15 @@ h1 {
   background: rgba(255, 255, 255, 0.14);
 }
 
+/* ------------------------------------------------------------------ */
+/* Biblioteca                                                          */
+/* ------------------------------------------------------------------ */
 .library-list {
   display: grid;
   gap: 10px;
   max-height: calc(100vh - 114px);
   overflow: auto;
   padding-right: 8px;
-  contain: content;
   overscroll-behavior: contain;
   scrollbar-color: rgba(255, 255, 255, 0.24) transparent;
   scrollbar-width: thin;
@@ -240,26 +288,16 @@ h1 {
 }
 
 .library-list::-webkit-scrollbar,
-.song-detail::-webkit-scrollbar {
-  width: 8px;
-}
+.song-detail::-webkit-scrollbar { width: 8px; }
 
 .library-list::-webkit-scrollbar-track,
-.song-detail::-webkit-scrollbar-track {
-  background: transparent;
-}
+.song-detail::-webkit-scrollbar-track { background: transparent; }
 
 .library-list::-webkit-scrollbar-thumb,
 .song-detail::-webkit-scrollbar-thumb {
   border: 2px solid transparent;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.16);
-  background-clip: padding-box;
-}
-
-.library-list::-webkit-scrollbar-thumb:hover,
-.song-detail::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.28);
   background-clip: padding-box;
 }
 
@@ -275,19 +313,18 @@ h1 {
   background: rgba(255, 255, 255, 0.05);
   padding: 8px;
   text-align: left;
-  contain: layout paint;
   transform: translateZ(0);
+  /* Solo se pinta lo visible → gran ahorro con 40+ canciones */
+  content-visibility: auto;
+  contain-intrinsic-size: 70px;
 }
 
 .song-card img {
   display: block;
   width: 100%;
   height: 100%;
-  object-fit: cover;
-}
-
-.song-card img {
   aspect-ratio: 1;
+  object-fit: cover;
   border-radius: 12px;
 }
 
@@ -299,19 +336,10 @@ h1 {
   white-space: nowrap;
 }
 
-.song-card strong {
-  font-size: 0.92rem;
-}
+.song-card strong { font-size: 0.92rem; }
+.song-card span { color: var(--muted); font-size: 0.78rem; }
 
-.song-card span {
-  color: var(--muted);
-  font-size: 0.78rem;
-}
-
-.song-card .song-card-copy {
-  min-width: 0;
-  overflow: visible;
-}
+.song-card .song-card-copy { min-width: 0; }
 
 .song-card .song-card-title {
   display: flex;
@@ -319,12 +347,7 @@ h1 {
   gap: 7px;
   min-width: 0;
   margin-bottom: 4px;
-  overflow: visible;
   line-height: 1.25;
-}
-
-.song-card .song-card-title strong {
-  min-width: 0;
 }
 
 .new-badge {
@@ -348,6 +371,9 @@ h1 {
   background: linear-gradient(135deg, rgba(var(--accent-rgb), 0.22), rgba(255, 255, 255, 0.06));
 }
 
+/* ------------------------------------------------------------------ */
+/* Área visual: ondas CSS + portada                                    */
+/* ------------------------------------------------------------------ */
 .visual-area {
   display: grid;
   grid-template-columns: minmax(82px, 1fr) minmax(180px, min(31vw, 35vh, 340px)) minmax(82px, 1fr);
@@ -357,10 +383,46 @@ h1 {
   margin: clamp(18px, 3vh, 34px) auto clamp(14px, 2vh, 24px);
 }
 
-.wave-canvas {
-  width: 100%;
+.wave-bars {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: clamp(2px, 0.5vh, 5px);
   height: clamp(170px, 31vh, 340px);
-  opacity: 0.96;
+  width: 100%;
+  overflow: hidden;
+  contain: strict;
+}
+
+.wave-bars span {
+  display: block;
+  flex: 0 0 auto;
+  height: 6px;
+  width: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg,
+      rgba(var(--accent-rgb), 0.9),
+      rgba(var(--accent-two-rgb), 0.32));
+  transform-origin: left center;
+  transform: scaleX(var(--rest, 0.15));
+  will-change: transform;
+}
+
+.wave-bars--right span {
+  transform-origin: right center;
+  background: linear-gradient(270deg,
+      rgba(var(--accent-rgb), 0.9),
+      rgba(var(--accent-two-rgb), 0.32));
+}
+
+body.is-playing .wave-bars span {
+  animation: barPulse var(--dur, 1.6s) ease-in-out infinite;
+  animation-delay: calc(var(--i) * -0.055s);
+}
+
+@keyframes barPulse {
+  0%, 100% { transform: scaleX(var(--rest, 0.15)); }
+  50%      { transform: scaleX(0.95); }
 }
 
 .cover-wrap {
@@ -379,7 +441,6 @@ h1 {
   height: 100%;
   display: block;
   object-fit: cover;
-  transform: scale(1.01);
 }
 
 .cover-shine {
@@ -389,11 +450,10 @@ h1 {
   mix-blend-mode: screen;
   transform: translateX(-70%);
   animation: coverSweep 7s ease-in-out infinite;
+  will-change: transform;
 }
 
-.track-meta {
-  text-align: center;
-}
+.track-meta { text-align: center; }
 
 .track-meta p {
   margin-bottom: 8px;
@@ -407,6 +467,9 @@ h1 {
   line-height: 1.02;
 }
 
+/* ------------------------------------------------------------------ */
+/* Transporte                                                          */
+/* ------------------------------------------------------------------ */
 .transport {
   width: min(760px, 100%);
   margin: clamp(16px, 2vh, 24px) auto 0;
@@ -437,10 +500,7 @@ input[type="range"] {
   accent-color: var(--accent-two);
 }
 
-.control-row {
-  gap: 16px;
-  margin-top: 12px;
-}
+.control-row { gap: 16px; margin-top: 12px; }
 
 .round-button {
   width: 46px;
@@ -458,19 +518,11 @@ input[type="range"] {
   box-shadow: 0 16px 42px rgba(var(--accent-rgb), 0.25);
 }
 
-.play-button svg {
-  width: 1.7rem;
-  height: 1.7rem;
-}
+.play-button svg { width: 1.7rem; height: 1.7rem; }
 
-.hidden {
-  display: none;
-}
+.hidden { display: none; }
 
-.sub-controls {
-  gap: 16px;
-  margin-top: 10px;
-}
+.sub-controls { gap: 16px; margin-top: 10px; }
 
 .text-toggle {
   min-width: 94px;
@@ -497,9 +549,7 @@ input[type="range"] {
   color: var(--muted);
 }
 
-.volume-control input {
-  min-width: 0;
-}
+.volume-control input { min-width: 0; }
 
 .status-text {
   min-height: 1.25rem;
@@ -509,6 +559,9 @@ input[type="range"] {
   font-size: 0.82rem;
 }
 
+/* ------------------------------------------------------------------ */
+/* Ficha lateral                                                       */
+/* ------------------------------------------------------------------ */
 .song-detail {
   display: flex;
   flex-direction: column;
@@ -518,6 +571,7 @@ input[type="range"] {
   padding-right: 8px;
   scrollbar-color: rgba(255, 255, 255, 0.24) transparent;
   scrollbar-width: thin;
+  -webkit-overflow-scrolling: touch;
 }
 
 .detail-cover {
@@ -570,7 +624,17 @@ input[type="range"] {
   text-transform: uppercase;
 }
 
-/* Botón de silencio del volumen */
+.detail-list dd {
+  margin: 0;
+  color: rgba(255, 247, 255, 0.88);
+  font-size: 0.9rem;
+  line-height: 1.58;
+  white-space: pre-line;
+}
+
+/* ------------------------------------------------------------------ */
+/* Botón de silencio                                                   */
+/* ------------------------------------------------------------------ */
 .mute-button {
   display: grid;
   flex: 0 0 auto;
@@ -605,71 +669,38 @@ input[type="range"] {
   color: var(--text);
 }
 
-.detail-list dd {
-  margin: 0;
-  color: rgba(255, 247, 255, 0.88);
-  font-size: 0.9rem;
-  line-height: 1.58;
-  white-space: pre-line;
-}
-
+/* ------------------------------------------------------------------ */
+/* Animaciones globales                                                */
+/* ------------------------------------------------------------------ */
 @keyframes drift {
-  from {
-    transform: rotate(0deg) scale(1);
-  }
-
-  to {
-    transform: rotate(22deg) scale(1.14);
-  }
+  from { transform: rotate(0deg) scale(1); }
+  to   { transform: rotate(22deg) scale(1.14); }
 }
 
 @keyframes floatPulse {
-
-  0%,
-  100% {
-    transform: translate3d(0, 0, 0) scale(1);
-  }
-
-  50% {
-    transform: translate3d(6vmax, -4vmax, 0) scale(1.18);
-  }
+  0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
+  50%      { transform: translate3d(6vmax, -4vmax, 0) scale(1.18); }
 }
 
 @keyframes coverSweep {
-
-  0%,
-  58% {
-    transform: translateX(-78%);
-  }
-
-  78%,
-  100% {
-    transform: translateX(78%);
-  }
+  0%, 58%   { transform: translateX(-78%); }
+  78%, 100% { transform: translateX(78%); }
 }
 
+/* ------------------------------------------------------------------ */
+/* Responsive                                                          */
+/* ------------------------------------------------------------------ */
 @media (max-width: 1040px) {
   .app-shell {
     height: auto;
     min-height: 100vh;
     grid-template-columns: 1fr;
-    grid-template-areas:
-      "player"
-      "detail"
-      "library";
+    grid-template-areas: "player" "detail" "library";
   }
 
-  .player-stage {
-    grid-area: player;
-  }
-
-  .library-panel {
-    grid-area: library;
-  }
-
-  .detail-panel {
-    grid-area: detail;
-  }
+  .player-stage { grid-area: player; }
+  .library-panel { grid-area: library; }
+  .detail-panel { grid-area: detail; }
 
   .library-list {
     grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
@@ -683,41 +714,33 @@ input[type="range"] {
     max-height: none;
   }
 
-  .detail-cover {
-    grid-row: span 3;
-    margin-bottom: 0;
-  }
+  .detail-cover { grid-row: span 3; margin-bottom: 0; }
+  .detail-list { grid-column: 1 / -1; margin-top: 18px; }
+}
 
-  .detail-list {
-    grid-column: 1 / -1;
-    margin-top: 18px;
-  }
+/* En móvil quitamos todas las animaciones de fondo costosas */
+@media (hover: none), (max-width: 720px) {
+  .ambient::after { animation: none; filter: blur(28px); opacity: 0.55; }
+  .color-orbit { animation: none; }
+  .color-orbit-b { display: none; } /* una sola órbita, ahorra GPU */
 }
 
 @media (max-width: 720px) {
-  body {
-    overflow-y: auto;
-  }
+  body { overflow-y: auto; }
 
   .app-shell {
     width: min(100% - 20px, 520px);
     height: auto;
     min-height: 100vh;
     grid-template-columns: 1fr;
-    grid-template-areas:
-      "player"
-      "detail"
-      "library";
+    grid-template-areas: "player" "detail" "library";
     padding: 10px 0 18px;
+    padding-top: max(10px, env(safe-area-inset-top));
+    padding-bottom: max(18px, env(safe-area-inset-bottom));
   }
 
-  .player-stage {
-    border-radius: 22px;
-  }
-
-  .top-bar {
-    align-items: flex-start;
-  }
+  .player-stage { border-radius: 22px; }
+  .top-bar { align-items: flex-start; }
 
   .visual-area {
     grid-template-columns: minmax(38px, 0.36fr) minmax(170px, 1fr) minmax(38px, 0.36fr);
@@ -725,41 +748,143 @@ input[type="range"] {
     margin-top: 24px;
   }
 
-  .wave-canvas {
-    height: 240px;
+  .wave-bars { height: 240px; }
+  .cover-wrap { border-radius: 22px; }
+
+  .detail-panel { border-radius: 20px; padding: 12px; }
+  .song-detail { display: flex; max-height: none; }
+  .detail-cover { width: 132px; margin-bottom: 14px; }
+
+  .library-panel { border-radius: 20px; }
+  .transport { border-radius: 20px; }
+}
+
+/* ------------------------------------------------------------------ */
+/* Accesibilidad                                                       */
+/* ------------------------------------------------------------------ */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
   }
 
-  .cover-wrap {
-    border-radius: 22px;
-  }
+  .wave-bars span { transform: scaleX(0.4) !important; }
+  .spark-field { display: none; }
+}
 
-  .detail-panel {
-    border-radius: 20px;
-    padding: 12px;
-  }
+/* ------------------------------------------------------------------ */
+/* Transición al cambiar de canción                                    */
+/* ------------------------------------------------------------------ */
+.visual-area,
+.track-meta {
+  transition:
+    opacity 320ms cubic-bezier(0.4, 0, 0.2, 1),
+    filter 320ms cubic-bezier(0.4, 0, 0.2, 1),
+    transform 320ms cubic-bezier(0.4, 0, 0.2, 1);
+  will-change: opacity, filter, transform;
+}
 
-  .song-detail {
-    display: flex;
-    max-height: none;
-  }
+.player-stage.is-changing .visual-area,
+.player-stage.is-changing .track-meta {
+  opacity: 0.15;
+  filter: blur(10px);
+  transform: scale(0.97);
+}
 
-  .detail-cover {
-    width: 132px;
-    margin-bottom: 14px;
-  }
+/* Entrada suave cuando vuelve la info (un pelín de rebote) */
+.player-stage.is-entering .visual-area,
+.player-stage.is-entering .track-meta {
+  animation: trackEnter 380ms cubic-bezier(0.2, 0.8, 0.3, 1) both;
+}
 
-  .library-panel {
-    border-radius: 20px;
+@keyframes trackEnter {
+  from {
+    opacity: 0.15;
+    filter: blur(10px);
+    transform: scale(0.97);
   }
-
-  .transport {
-    border-radius: 20px;
+  to {
+    opacity: 1;
+    filter: blur(0);
+    transform: scale(1);
   }
+}
 
-  /* Botón de silencio del volumen */
-  .volume-control {
-    display: flex;
-    align-items: center;
-  }
+/* ------------------------------------------------------------------ */
+/* Pantalla de carga                                                    */
+/* ------------------------------------------------------------------ */
+.loading-screen {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: grid;
+  place-items: center;
+  background:
+    radial-gradient(circle at 50% 40%, rgba(216, 167, 255, 0.08), transparent 60%),
+    radial-gradient(circle at 80% 20%, rgba(255, 158, 216, 0.06), transparent 50%),
+    #07050c;
+  opacity: 1;
+  visibility: visible;
+  transition:
+    opacity 700ms cubic-bezier(0.4, 0, 0.2, 1),
+    visibility 700ms;
+  will-change: opacity;
+}
 
+.loading-screen.is-hidden {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.loading-content {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 26px;
+  padding: 24px;
+  text-align: center;
+  animation: loadingFadeIn 500ms ease both;
+}
+
+@keyframes loadingFadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.loading-spinner {
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  border: 3px solid rgba(255, 255, 255, 0.08);
+  border-top-color: var(--accent);
+  border-right-color: var(--accent-two);
+  animation: spinnerSpin 900ms linear infinite;
+  will-change: transform;
+}
+
+@keyframes spinnerSpin {
+  to { transform: rotate(360deg); }
+}
+
+.loading-text {
+  margin: 0;
+  color: rgba(255, 247, 255, 0.9);
+  font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: clamp(0.95rem, 2vw, 1.05rem);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  animation: loadingPulse 1.8s ease-in-out infinite;
+}
+
+@keyframes loadingPulse {
+  0%, 100% { opacity: 0.7; }
+  50%      { opacity: 1; }
+}
+
+/* En modo reducido, menos movimiento */
+@media (prefers-reduced-motion: reduce) {
+  .loading-spinner { animation-duration: 1.4s; }
+  .loading-text { animation: none; opacity: 1; }
 }

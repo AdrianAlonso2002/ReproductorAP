@@ -1,3 +1,11 @@
+/* ================================================================== */
+/*  Reproductor AP — optimizado para iOS PWA                          */
+/*  - Sin AudioContext ni osciladores (batería)                       */
+/*  - Sin canvas ni rAF constante (batería)                           */
+/*  - Media Session completa (next/prev desde lock screen)            */
+/*  - Orden corregido (sin saltos aleatorios en modo normal)          */
+/* ================================================================== */
+
 const playlist = Array.isArray(window.PLAYLIST) ? window.PLAYLIST : [];
 const defaultCover = "assets/default-cover.png";
 
@@ -26,13 +34,13 @@ const elements = {
   shuffle: document.getElementById("shuffleButton"),
   playIcon: document.getElementById("playIcon"),
   pauseIcon: document.getElementById("pauseIcon"),
-  leftWave: document.getElementById("leftWave"),
-  rightWave: document.getElementById("rightWave"),
-  spark: document.getElementById("sparkCanvas"),
   mute: document.getElementById("muteButton"),
   volumeOnIcon: document.getElementById("volumeOnIcon"),
   volumeOffIcon: document.getElementById("volumeOffIcon"),
-  volumeIconFallback: document.querySelector(".volume-control svg")
+  volumeIconFallback: document.querySelector(".volume-control svg"),
+  waveLeft: document.querySelector(".wave-bars--left"),
+  waveRight: document.querySelector(".wave-bars--right"),
+  sparkField: document.querySelector(".spark-field")
 };
 
 let currentIndex = 0;
@@ -40,77 +48,129 @@ let isPlaying = false;
 let isSeeking = false;
 let shuffle = false;
 let hasUserSelectedTrack = false;
-let audioContext;
-let mediaSource;
-let mediaStreamSource;
-let analyser;
-let masterGain;
-let dataArray;
-let audioGraphConnected = false;
-let mediaSourceConnected = false;
-let passiveAnalysisConnected = false;
 let isMuted = false;
 let lastVolume = 0.82;
-let visualPulse = 0;
-let demoNodes = [];
+let lastRenderedSecond = -1;
+let lastPositionUpdate = 0;
+let preloadedLink = null;
+const TRANSITION_MS = 220;
+let transitionTimer = null;
+let isFirstLoad = true;
+
+// Demo (track sin src): solo reloj, sin audio
 let demoStartedAt = 0;
 let demoPausedAt = 0;
-let visualOnlyDemo = false;
-let lastPointerToggleAt = 0;
-let lastRenderedSecond = -1;
-
-// ---- Rendimiento / batería ----------------------------------------------
-let lastDrawTime = 0;
-let lastSparkTime = 0;
-let lastAnalyserTime = 0;
-let animationActive = true;
-const DRAW_INTERVAL_PLAYING = 33;    // ~30 fps
-const DRAW_INTERVAL_PAUSED = 140;    // ~7 fps (visual vivo pero barato)
-const SPARK_INTERVAL_PLAYING = 55;   // ~18 fps
-const SPARK_INTERVAL_PAUSED = 200;   // ~5 fps
-const ANALYSER_INTERVAL = 60;        // muestreo ~16 fps
-// Tamaños de canvas cacheados (evita getBoundingClientRect cada frame)
-const canvasSizes = new WeakMap();
+let demoRafId = 0;
 
 const metadataCache = new Map();
-const sparkles = Array.from({ length: 22 }, () => createSparkle());
 
-lastVolume = getVolumeValue() || 0.82;
-elements.audio.volume = lastVolume;
-elements.audio.muted = false;
-setupVolumeIconFallback();
-updateMuteIcon();
-
-// -------------------------------------------------------------------------
+// ------------------------------------------------------------------
 // Arranque
-// -------------------------------------------------------------------------
+// ------------------------------------------------------------------
 function boot() {
+  // Manifest solo en http(s) — evita el error de CORS en file://
+  if (location.protocol === "http:" || location.protocol === "https:") {
+    const link = document.createElement("link");
+    link.rel = "manifest";
+    link.href = "manifest.json";
+    document.head.appendChild(link);
+  }
+  buildWaveBars();
+  buildSparkles();
+
   elements.count.textContent = playlist.length;
   setupMediaSession();
+  setupKeyboardShortcuts();
+  registerServiceWorker();
+
   renderLibrary();
   loadTrack(0, false);
   hydrateAllTrackMetadata();
-  document.addEventListener("visibilitychange", handleVisibilityChange);
-  window.addEventListener("pagehide", () => { animationActive = false; });
-  window.addEventListener("pageshow", () => { animationActive = true; });
-  requestAnimationFrame(draw);
-  requestAnimationFrame(drawSparkles);
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && isPlaying) {
+      // Por si iOS libera el audio al volver del background
+      if (!getTrack().demo && elements.audio.paused) {
+        // No forzamos play (iOS podría bloquear); solo refrescamos handlers
+        refreshMediaSessionHandlers();
+      }
+      // Reanudar loop demo si hacía falta
+      if (getTrack().demo && isPlaying) startDemoLoop();
+    }
+  });
+
+  // Necesario: el volumen inicial se aplica cuando el audio existe
+  elements.audio.volume = lastVolume;
+  elements.audio.muted = false;
+  updateMuteIcon();
+  hideLoadingScreenWhenReady();
 }
 
-function handleVisibilityChange() {
-  if (document.hidden) {
-    animationActive = false;
-  } else {
-    animationActive = true;
-    // Reiniciar relojes para que no salte el throttle al volver
-    lastDrawTime = 0;
-    lastSparkTime = 0;
-  }
+function hideLoadingScreenWhenReady() {
+  const MIN_SHOW_MS = 700; // mínimo visible para que no sea un flash
+  const start = performance.now();
+
+  const waitForCover = new Promise((resolve) => {
+    const img = elements.cover;
+    if (img.complete && img.naturalWidth > 0) return resolve();
+    img.addEventListener("load", resolve, { once: true });
+    img.addEventListener("error", resolve, { once: true });
+    setTimeout(resolve, 2000);
+  });
+
+  const waitForAudio = new Promise((resolve) => {
+    const track = getTrack();
+    if (track.demo || elements.audio.readyState >= 1) return resolve();
+    elements.audio.addEventListener("loadedmetadata", resolve, { once: true });
+    setTimeout(resolve, 2000);
+  });
+
+  // Safety net: nunca más de 6s en pantalla
+  const safety = new Promise((resolve) => setTimeout(resolve, 6000));
+
+  Promise.race([Promise.all([waitForCover, waitForAudio]), safety]).then(() => {
+    const elapsed = performance.now() - start;
+    const remaining = Math.max(0, MIN_SHOW_MS - elapsed);
+
+    setTimeout(() => {
+      const screen = document.getElementById("loadingScreen");
+      if (!screen || screen.classList.contains("is-hidden")) return;
+      screen.classList.add("is-hidden");
+      // Quitamos el nodo del DOM cuando termina la transición
+      setTimeout(() => screen.remove(), 750);
+    }, remaining);
+  });
 }
 
-// -------------------------------------------------------------------------
-// Media Session (iOS / Android lock screen)
-// -------------------------------------------------------------------------
+// ------------------------------------------------------------------
+// Generadores visuales (una sola vez)
+// ------------------------------------------------------------------
+function buildWaveBars() {
+  const build = (count) =>
+    Array.from({ length: count }, (_, i) => {
+      const rest = Math.max(0.08, 0.1 + Math.abs(Math.sin(i * 0.7)) * 0.35);
+      const dur = (1.2 + ((i * 7) % 9) * 0.08).toFixed(2);
+      return `<span style="--i:${i};--rest:${rest.toFixed(2)};--dur:${dur}s"></span>`;
+    }).join("");
+
+  if (elements.waveLeft) elements.waveLeft.innerHTML = build(22);
+  if (elements.waveRight) elements.waveRight.innerHTML = build(22);
+}
+
+function buildSparkles() {
+  if (!elements.sparkField) return;
+  elements.sparkField.innerHTML = Array.from({ length: 12 }, (_, i) => {
+    const x = (4 + i * 8 + Math.random() * 4).toFixed(1);
+    const d = (12 + Math.random() * 8).toFixed(1);
+    const s = (1.5 + Math.random() * 2.5).toFixed(1);
+    const delay = (-(Math.random() * parseFloat(d))).toFixed(1);
+    return `<span style="--x:${x}%;--d:${d}s;--s:${s}px;animation-delay:${delay}s"></span>`;
+  }).join("");
+}
+
+// ------------------------------------------------------------------
+// Media Session (lock screen iOS / Android)
+// ------------------------------------------------------------------
 function safeSetHandler(action, handler) {
   if (!("mediaSession" in navigator)) return false;
   try {
@@ -124,7 +184,7 @@ function safeSetHandler(action, handler) {
 function setupMediaSession() {
   if (!("mediaSession" in navigator)) return;
 
-  // Cada handler va por separado para que un fallo no bloquee el resto.
+  // Cada handler va aislado: un fallo no rompe el resto
   safeSetHandler("play", () => playCurrent().catch(handlePlayError));
   safeSetHandler("pause", pauseCurrent);
   safeSetHandler("stop", pauseCurrent);
@@ -135,21 +195,17 @@ function setupMediaSession() {
     if (!Number.isFinite(details.seekTime) || getTrack().demo) return;
     elements.audio.currentTime = details.seekTime;
     updateRealClock(true);
-    updateMediaPosition();
+    updateMediaPosition(true);
   });
 
-  // MUY IMPORTANTE: al registrar seekbackward/seekforward como null,
-  // iOS deja de mostrar los botones de ±10s y muestra next/prev.
+  // CLAVE en iOS: desactivar los botones ±10s para que salgan prev/next
   safeSetHandler("seekbackward", null);
   safeSetHandler("seekforward", null);
-
-  // Un pequeño empujón: iOS también respeta estos si están definidos.
-  safeSetHandler("skipad", null);
 }
 
 /**
- * iOS "olvida" los handlers cuando cambia el src del <audio>.
- * Los volvemos a registrar cada vez que cargamos una pista.
+ * iOS "olvida" los handlers al cambiar el src del <audio>.
+ * Los re-registramos cada vez que cargamos una pista.
  */
 function refreshMediaSessionHandlers() {
   if (!("mediaSession" in navigator)) return;
@@ -161,13 +217,15 @@ function refreshMediaSessionHandlers() {
     if (!Number.isFinite(details.seekTime) || getTrack().demo) return;
     elements.audio.currentTime = details.seekTime;
     updateRealClock(true);
-    updateMediaPosition();
+    updateMediaPosition(true);
   });
+  safeSetHandler("seekbackward", null);
+  safeSetHandler("seekforward", null);
 }
 
-// -------------------------------------------------------------------------
-// Normalización / biblioteca
-// -------------------------------------------------------------------------
+// ------------------------------------------------------------------
+// Normalización
+// ------------------------------------------------------------------
 function normalizeTrack(track, index) {
   return {
     id: `${track.title || "track"}-${track.artist || "artist"}-${index}`,
@@ -189,6 +247,9 @@ function getTrack(index = currentIndex) {
   return normalizeTrack(playlist[index] || {}, index);
 }
 
+// ------------------------------------------------------------------
+// Biblioteca
+// ------------------------------------------------------------------
 function renderLibrary() {
   elements.library.innerHTML = "";
   const fragment = document.createDocumentFragment();
@@ -199,7 +260,8 @@ function renderLibrary() {
     button.type = "button";
     button.dataset.index = index;
     button.innerHTML = `
-      <img src="${track.cover}" alt="" loading="lazy" decoding="async" onerror="this.src='${defaultCover}'" />
+      <img src="${track.cover}" alt="" loading="lazy" decoding="async"
+           onerror="this.onerror=null;this.src='${defaultCover}'" />
       <span class="song-card-copy">
         <span class="song-card-title">
           <strong>${escapeHtml(track.title)}</strong>
@@ -223,14 +285,14 @@ function updateLibraryCard(index) {
   const title = card.querySelector("strong");
   const artist = card.querySelector(".song-card-artist");
 
-  if (image) image.src = track.cover;
+  if (image && image.src !== track.cover) image.src = track.cover;
   if (title) title.textContent = track.title;
   if (artist) artist.textContent = track.artist;
 }
 
-// -------------------------------------------------------------------------
+// ------------------------------------------------------------------
 // Carga / reproducción
-// -------------------------------------------------------------------------
+// ------------------------------------------------------------------
 function selectTrack(index, autoplay) {
   hasUserSelectedTrack = true;
 
@@ -242,18 +304,19 @@ function selectTrack(index, autoplay) {
   loadTrack(index, autoplay);
 }
 
-function loadTrack(index, autoplay) {
+function loadTrackInternal(index, autoplay, { instantAccent = false } = {}) {
   currentIndex = wrapIndex(index);
   const track = getTrack();
 
-  stopDemo();
-  elements.audio.pause();
+  stopDemoLoop();
 
-  // No borramos src: asignar uno nuevo ya limpia el buffer.
-  if (track.demo) {
-    elements.audio.removeAttribute("src");
-    elements.audio.load();
-  } else {
+  // Reset explícito: imprescindible en iOS para no arrastrar estado anterior
+  elements.audio.pause();
+  elements.audio.removeAttribute("src");
+  elements.audio.load();
+
+  // Asignar la nueva fuente solo si es real
+  if (!track.demo) {
     elements.audio.src = track.src;
   }
 
@@ -273,19 +336,55 @@ function loadTrack(index, autoplay) {
   elements.play.title = "Play";
 
   updatePlayState(false);
-  applyAccent(track.color);
+  applyAccent(track.color, !instantAccent);
   setActiveCards();
   renderDetails(track);
 
   extractPalette(track.cover, track.color);
   hydrateTrackMetadata(currentIndex);
 
-  // CRUCIAL para iOS: re-registrar handlers tras cada cambio de pista.
+  // CRUCIAL: re-registrar handlers tras cada cambio de src
   refreshMediaSessionHandlers();
 
   if (autoplay) {
     playCurrent().catch(handlePlayError);
   }
+}
+
+function loadTrack(index, autoplay, { silent = false } = {}) {
+  if (transitionTimer) {
+    clearTimeout(transitionTimer);
+    transitionTimer = null;
+  }
+
+  const skipTransition = isFirstLoad || silent;
+  const stage = document.querySelector(".player-stage");
+  const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  // Sin transición: primera carga, silencioso, sin stage, o reduced-motion
+  if (skipTransition || !stage || reduced) {
+    isFirstLoad = false;
+    loadTrackInternal(index, autoplay, { instantAccent: skipTransition });
+    return;
+  }
+
+  // 1) Fade out
+  stage.classList.remove("is-entering");
+  stage.classList.add("is-changing");
+
+  // 2) En el punto medio: cambiar la canción
+  transitionTimer = setTimeout(() => {
+    transitionTimer = null;
+
+    loadTrackInternal(index, autoplay, { instantAccent: false });
+
+    // 3) Fade in con "pop"
+    stage.classList.remove("is-changing");
+    void stage.offsetWidth;
+    stage.classList.add("is-entering");
+
+    setTimeout(() => stage.classList.remove("is-entering"), 400);
+  }, TRANSITION_MS);
 }
 
 function renderDetails(track) {
@@ -308,19 +407,11 @@ async function playCurrent() {
   const track = getTrack();
 
   if (track.demo) {
-    try {
-      await ensureAudioGraph(true);
-      visualOnlyDemo = false;
-    } catch {
-      visualOnlyDemo = true;
-      demoStartedAt = performance.now() / 1000 - demoPausedAt;
-      elements.status.textContent = "Demo visual activa";
-      updatePlayState(true);
-      return;
-    }
-
-    startDemo();
+    // Demo puramente visual (sin AudioContext)
+    demoStartedAt = performance.now() / 1000 - demoPausedAt;
+    elements.status.textContent = "Demo visual activa";
     updatePlayState(true);
+    startDemoLoop();
     return;
   }
 
@@ -333,15 +424,10 @@ async function playCurrent() {
     updatePlayState(true);
     elements.status.textContent = "";
 
-    // Volver a colocar los handlers justo después de arrancar el audio.
+    // Justo después de arrancar: volver a colocar handlers (iOS)
     refreshMediaSessionHandlers();
-
-    try {
-      await ensureAudioGraph(false);
-    } catch {
-      dataArray = null;
-    }
-  } catch {
+    } catch (err) {
+    console.error("[playCurrent]", err?.name, err?.message);
     handlePlayError();
   }
 }
@@ -353,7 +439,9 @@ function handlePlayError() {
 
 function pauseCurrent() {
   if (getTrack().demo) {
-    pauseDemo();
+    demoPausedAt = getDemoTime();
+    stopDemoLoop();
+    elements.status.textContent = "Demo en pausa";
   } else {
     elements.audio.pause();
   }
@@ -361,158 +449,21 @@ function pauseCurrent() {
   updatePlayState(false);
 }
 
-// -------------------------------------------------------------------------
-// Audio Graph (solo para análisis real, no imprescindible)
-// -------------------------------------------------------------------------
-async function ensureAudioGraph(isDemo) {
-  const AudioCtx = window.AudioContext || window.webkitAudioContext;
-
-  if (!AudioCtx) {
-    throw new Error("AudioContext no disponible");
-  }
-
-  if (!isDemo && window.location.protocol === "file:") {
-    throw new Error("AudioContext bloqueado en file://");
-  }
-
-  // En móvil preferimos no crear siquiera el AudioContext: ahorra batería
-  // y evita problemas de audio en segundo plano.
-  if (!isDemo && isMobilePlaybackSensitive()) {
-    throw new Error("Análisis real desactivado en móvil");
-  }
-
-  if (!audioContext) {
-    audioContext = new AudioCtx();
-
-    analyser = audioContext.createAnalyser();
-    analyser.fftSize = 512;
-    analyser.smoothingTimeConstant = 0.68;
-
-    masterGain = audioContext.createGain();
-    dataArray = new Uint8Array(analyser.frequencyBinCount);
-  }
-
-  if (audioContext.state === "suspended") {
-    await audioContext.resume();
-  }
-
-  if (isDemo) {
-    connectAnalyserToOutput();
-    syncOutputVolume();
-    return;
-  }
-
-  if (!mediaSourceConnected && !passiveAnalysisConnected) {
-    const captureStream = elements.audio.captureStream || elements.audio.mozCaptureStream;
-
-    if (captureStream) {
-      const stream = captureStream.call(elements.audio);
-
-      if (stream && stream.getAudioTracks().length) {
-        mediaStreamSource = audioContext.createMediaStreamSource(stream);
-        mediaStreamSource.connect(analyser);
-        passiveAnalysisConnected = true;
-        return;
-      }
-    }
-
-    connectAnalyserToOutput();
-
-    if (!mediaSource) {
-      mediaSource = audioContext.createMediaElementSource(elements.audio);
-    }
-
-    mediaSource.connect(analyser);
-    mediaSourceConnected = true;
-  }
-
-  syncOutputVolume();
-}
-
-function connectAnalyserToOutput() {
-  if (audioGraphConnected) return;
-
-  analyser.connect(masterGain);
-  masterGain.connect(audioContext.destination);
-  audioGraphConnected = true;
-}
-
-function isMobilePlaybackSensitive() {
-  return /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)
-    || (navigator.maxTouchPoints > 1 && Math.min(window.innerWidth, window.innerHeight) < 940);
-}
-
-// -------------------------------------------------------------------------
-// Demo (osciladores)
-// -------------------------------------------------------------------------
-function startDemo() {
-  stopDemo();
-
-  const now = audioContext.currentTime;
-  demoStartedAt = now - demoPausedAt;
-  const base = [174, 220, 261.63, 329.63];
-
-  demoNodes = base.map((frequency, index) => {
-    const oscillator = audioContext.createOscillator();
-    const gain = audioContext.createGain();
-
-    oscillator.type = index % 2 ? "triangle" : "sine";
-    oscillator.frequency.setValueAtTime(frequency, now);
-    oscillator.detune.setValueAtTime(index * 5, now);
-
-    gain.gain.setValueAtTime(0.0001, now);
-    gain.gain.exponentialRampToValueAtTime(0.035 / (index + 1), now + 0.45);
-
-    oscillator.connect(gain);
-    gain.connect(analyser);
-    oscillator.start(now);
-
-    return { oscillator, gain };
-  });
-
-  elements.status.textContent = "Reproduciendo demo";
-}
-
-function pauseDemo() {
-  demoPausedAt = getDemoTime();
-  stopDemo(false);
-  visualOnlyDemo = false;
-  elements.status.textContent = "Demo en pausa";
-}
-
-function stopDemo(resetTime = true) {
-  demoNodes.forEach(({ oscillator, gain }) => {
-    try {
-      const now = audioContext ? audioContext.currentTime : 0;
-      gain.gain.cancelScheduledValues(now);
-      gain.gain.setTargetAtTime(0.0001, now, 0.03);
-      oscillator.stop(now + 0.12);
-    } catch {
-      oscillator.disconnect();
-    }
-  });
-
-  demoNodes = [];
-
-  if (resetTime) {
-    demoPausedAt = 0;
-  }
-}
-
-// -------------------------------------------------------------------------
-// Estado / controles
-// -------------------------------------------------------------------------
+// ------------------------------------------------------------------
+// Estado / navegación
+// ------------------------------------------------------------------
 function updatePlayState(nextState) {
   isPlaying = nextState;
   elements.playIcon.classList.toggle("hidden", isPlaying);
   elements.pauseIcon.classList.toggle("hidden", !isPlaying);
   elements.play.title = isPlaying ? "Pausa" : "Play";
+  document.body.classList.toggle("is-playing", isPlaying);
 
   if ("mediaSession" in navigator) {
     try {
       navigator.mediaSession.playbackState = isPlaying ? "playing" : "paused";
     } catch {
-      // opcional en algunos navegadores
+      // opcional
     }
   }
 }
@@ -535,7 +486,6 @@ function getNextIndex() {
   while (nextIndex === currentIndex) {
     nextIndex = Math.floor(Math.random() * playlist.length);
   }
-
   return nextIndex;
 }
 
@@ -545,39 +495,40 @@ function wrapIndex(index) {
 }
 
 function setActiveCards() {
-  // Más barato: no iterar si no hay biblioteca visible
   if (!elements.library.children.length) return;
-  document.querySelectorAll(".song-card").forEach((card) => {
+  const cards = document.querySelectorAll(".song-card");
+  cards.forEach((card) => {
     card.classList.toggle("is-active", Number(card.dataset.index) === currentIndex);
   });
 }
 
-// -------------------------------------------------------------------------
-// Hidratación de metadatos (con arreglo de orden)
-// -------------------------------------------------------------------------
+// ------------------------------------------------------------------
+// Hidratación de metadatos — CON FIX DE RAZA
+// ------------------------------------------------------------------
 async function hydrateAllTrackMetadata() {
   for (let index = 0; index < playlist.length; index += 1) {
     await waitForIdle();
     await hydrateTrackMetadata(index);
   }
 
-  // FIX raza: capturamos la canción ACTUAL justo antes de reordenar.
   const currentSrc = playlist[currentIndex]?.src;
 
   playlist.sort((a, b) => getDateScore(b) - getDateScore(a));
   renderLibrary();
 
-  if (!hasUserSelectedTrack && !isPlaying) {
-    loadTrack(0, false);
-    return;
-  }
-
+  // Re-mapear el índice del track que estábamos mostrando
   if (currentSrc) {
     const newIndex = playlist.findIndex((track) => track.src === currentSrc);
-    if (newIndex >= 0) {
+    if (newIndex >= 0 && newIndex !== currentIndex) {
       currentIndex = newIndex;
       setActiveCards();
     }
+    return;
+  }
+
+  // Fallback: nada seleccionado y no reproduciendo → aseguramos índice 0
+  if (!hasUserSelectedTrack && !isPlaying) {
+    loadTrack(0, false, { silent: true });
   }
 }
 
@@ -605,7 +556,9 @@ async function hydrateTrackMetadata(index) {
       artist: metadata.artist || metadata.albumArtist || playlist[index].artist,
       album: metadata.album || playlist[index].album,
       date: metadata.date || playlist[index].date,
-      cover: hasCustomCover(playlist[index].cover) ? playlist[index].cover : metadata.cover || playlist[index].cover
+      cover: hasCustomCover(playlist[index].cover)
+        ? playlist[index].cover
+        : metadata.cover || playlist[index].cover
     };
 
     metadataCache.set(track.src, "done");
@@ -653,21 +606,20 @@ function getDateScore(track) {
   return year * 10000 + month * 100 + day;
 }
 
-// -------------------------------------------------------------------------
-// ID3 (lectura por rangos, sin descargar el mp3 completo)
-// -------------------------------------------------------------------------
+// ------------------------------------------------------------------
+// ID3 (lectura por rangos, no descarga el mp3 completo)
+// ------------------------------------------------------------------
 async function readId3Metadata(src) {
+  // En file:// fetch no funciona (CORS). Salimos sin romper nada.
+  if (location.protocol === "file:") return null;
   const headerResponse = await fetch(src, { headers: { Range: "bytes=0-9" } });
-
   if (!headerResponse.ok && headerResponse.status !== 206) return null;
 
   const headerBytes = new Uint8Array(await headerResponse.arrayBuffer());
-
   if (headerBytes.length < 10 || latin1(headerBytes, 0, 3) !== "ID3") return null;
 
   const headerTagSize = synchsafe(headerBytes[6], headerBytes[7], headerBytes[8], headerBytes[9]);
   const response = await fetch(src, { headers: { Range: `bytes=0-${headerTagSize + 9}` } });
-
   if (!response.ok && response.status !== 206) return null;
 
   const bytes = new Uint8Array(await response.arrayBuffer());
@@ -680,7 +632,6 @@ async function readId3Metadata(src) {
     const extendedSize = version === 4
       ? synchsafe(bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3])
       : readUint32(bytes, offset);
-
     offset += Math.max(4, extendedSize);
   }
 
@@ -688,7 +639,6 @@ async function readId3Metadata(src) {
 
   while (offset + 10 <= limit) {
     const id = latin1(bytes, offset, offset + 4);
-
     if (!/^[A-Z0-9]{4}$/.test(id)) break;
 
     const size = version === 4
@@ -714,7 +664,6 @@ async function readId3Metadata(src) {
 
 function decodeApicFrame(frame) {
   if (!frame.length) return "";
-
   const encoding = frame[0];
   let offset = 1;
   const mimeEnd = findTerminator(frame, offset, 0);
@@ -727,7 +676,6 @@ function decodeApicFrame(frame) {
   offset = descriptionEnd + terminatorLength(encoding);
 
   const imageBytes = frame.slice(offset);
-
   if (!imageBytes.length || !mime.startsWith("image/")) return "";
 
   return URL.createObjectURL(new Blob([imageBytes], { type: mime }));
@@ -735,18 +683,13 @@ function decodeApicFrame(frame) {
 
 function decodeTextFrame(frame) {
   if (!frame.length) return "";
-
   const encoding = frame[0];
   const content = frame.slice(1);
   let text = "";
 
-  if (encoding === 0) {
-    text = new TextDecoder("iso-8859-1").decode(content);
-  } else if (encoding === 3) {
-    text = new TextDecoder("utf-8").decode(content);
-  } else {
-    text = decodeUtf16(content, encoding === 2);
-  }
+  if (encoding === 0) text = new TextDecoder("iso-8859-1").decode(content);
+  else if (encoding === 3) text = new TextDecoder("utf-8").decode(content);
+  else text = decodeUtf16(content, encoding === 2);
 
   return cleanTagText(text);
 }
@@ -767,38 +710,23 @@ function decodeUtf16(bytes, bigEndian) {
   let offset = 0;
   let littleEndian = !bigEndian;
 
-  if (bytes[0] === 0xff && bytes[1] === 0xfe) {
-    littleEndian = true;
-    offset = 2;
-  } else if (bytes[0] === 0xfe && bytes[1] === 0xff) {
-    littleEndian = false;
-    offset = 2;
-  }
+  if (bytes[0] === 0xff && bytes[1] === 0xfe) { littleEndian = true; offset = 2; }
+  else if (bytes[0] === 0xfe && bytes[1] === 0xff) { littleEndian = false; offset = 2; }
 
   const codes = [];
-
   for (let index = offset; index + 1 < bytes.length; index += 2) {
-    codes.push(
-      littleEndian
-        ? bytes[index] | (bytes[index + 1] << 8)
-        : (bytes[index] << 8) | bytes[index + 1]
-    );
+    codes.push(littleEndian
+      ? bytes[index] | (bytes[index + 1] << 8)
+      : (bytes[index] << 8) | bytes[index + 1]);
   }
-
   return String.fromCharCode(...codes);
 }
 
 function findEncodedTerminator(bytes, offset, encoding) {
-  if (encoding === 0 || encoding === 3) {
-    return findTerminator(bytes, offset, 0);
-  }
-
+  if (encoding === 0 || encoding === 3) return findTerminator(bytes, offset, 0);
   for (let index = offset; index + 1 < bytes.length; index += 2) {
-    if (bytes[index] === 0 && bytes[index + 1] === 0) {
-      return index;
-    }
+    if (bytes[index] === 0 && bytes[index + 1] === 0) return index;
   }
-
   return bytes.length;
 }
 
@@ -810,7 +738,6 @@ function findTerminator(bytes, offset, value) {
   for (let index = offset; index < bytes.length; index += 1) {
     if (bytes[index] === value) return index;
   }
-
   return bytes.length;
 }
 
@@ -823,35 +750,113 @@ function synchsafe(a, b, c, d) {
 }
 
 function readUint32(bytes, offset) {
-  return (bytes[offset] << 24)
-    | (bytes[offset + 1] << 16)
-    | (bytes[offset + 2] << 8)
-    | bytes[offset + 3];
+  return (bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3];
 }
 
-// -------------------------------------------------------------------------
-// Paleta / acento
-// -------------------------------------------------------------------------
-function applyAccent(hex) {
+/* ------------------------------------------------------------------ */
+/* Acento de color: aplicación instantánea + interpolación suave      */
+/* ------------------------------------------------------------------ */
+
+// Cache de los valores actuales → evita leer getComputedStyle cada frame
+let currentAccentRGB = [216, 167, 255];
+let currentAccentTwoRGB = [255, 158, 216];
+let accentTweenId = 0;
+
+const prefersReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+function setAccentVars(a, b) {
+  const root = document.documentElement.style;
+  const ar = Math.round(a[0]);
+  const ag = Math.round(a[1]);
+  const ab = Math.round(a[2]);
+  const br = Math.round(b[0]);
+  const bg = Math.round(b[1]);
+  const bb = Math.round(b[2]);
+
+  root.setProperty("--accent-rgb", `${ar}, ${ag}, ${ab}`);
+  root.setProperty("--accent-two-rgb", `${br}, ${bg}, ${bb}`);
+  root.setProperty("--accent", rgbToHex([ar, ag, ab]));
+  root.setProperty("--accent-two", rgbToHex([br, bg, bb]));
+}
+
+/**
+ * Interpola suavemente los colores actuales hasta los de la nueva canción.
+ * Se usa easing easeInOutQuad para que arranque y termine fino.
+ */
+function tweenAccent(targetHex, durationMs = 600) {
+  const target = hexToRgb(targetHex) || [216, 167, 255];
+  const targetTwo = rotateColor(target);
+
+  const fromA = [...currentAccentRGB];
+  const fromB = [...currentAccentTwoRGB];
+
+  if (accentTweenId) {
+    cancelAnimationFrame(accentTweenId);
+    accentTweenId = 0;
+  }
+
+  const start = performance.now();
+  const ease = (t) => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+
+  const step = (now) => {
+    const t = Math.min(1, (now - start) / durationMs);
+    const e = ease(t);
+
+    const a = [
+      fromA[0] + (target[0] - fromA[0]) * e,
+      fromA[1] + (target[1] - fromA[1]) * e,
+      fromA[2] + (target[2] - fromA[2]) * e
+    ];
+    const b = [
+      fromB[0] + (targetTwo[0] - fromB[0]) * e,
+      fromB[1] + (targetTwo[1] - fromB[1]) * e,
+      fromB[2] + (targetTwo[2] - fromB[2]) * e
+    ];
+
+    setAccentVars(a, b);
+    currentAccentRGB = a;
+    currentAccentTwoRGB = b;
+
+    if (t < 1) {
+      accentTweenId = requestAnimationFrame(step);
+    } else {
+      accentTweenId = 0;
+      currentAccentRGB = target;
+      currentAccentTwoRGB = targetTwo;
+    }
+  };
+
+  accentTweenId = requestAnimationFrame(step);
+}
+
+/**
+ * Aplica un color. Si `animate` es true, hace un tween suave desde el
+ * color actual. Si no, lo aplica instantáneo.
+ */
+function applyAccent(hex, animate = false) {
   const primary = hexToRgb(hex) || [216, 167, 255];
   const secondary = rotateColor(primary);
 
-  document.documentElement.style.setProperty("--accent", rgbToHex(primary));
-  document.documentElement.style.setProperty("--accent-rgb", primary.join(", "));
-  document.documentElement.style.setProperty("--accent-two", rgbToHex(secondary));
-  document.documentElement.style.setProperty("--accent-two-rgb", secondary.join(", "));
+  if (!animate || prefersReducedMotion) {
+    currentAccentRGB = primary;
+    currentAccentTwoRGB = secondary;
+    setAccentVars(primary, secondary);
+    return;
+  }
+
+  tweenAccent(hex, 600);
 }
 
 function extractPalette(src, fallback) {
   const image = new Image();
-  image.crossOrigin = "anonymous";
+  // Sin crossOrigin: todo es same-origin y esto evita conflictos con el SW
   image.decoding = "async";
 
   image.onload = () => {
     try {
       const canvas = document.createElement("canvas");
       const context = canvas.getContext("2d", { willReadFrequently: true });
-      const size = 24; // más pequeño = menos CPU
+      const size = 24;
 
       canvas.width = size;
       canvas.height = size;
@@ -863,215 +868,37 @@ function extractPalette(src, fallback) {
       for (let i = 0; i < pixels.length; i += 16) {
         const alpha = pixels[i + 3];
         if (alpha < 120) continue;
-
         const brightness = (pixels[i] + pixels[i + 1] + pixels[i + 2]) / 3;
         if (brightness < 18 || brightness > 238) continue;
 
-        r += pixels[i];
-        g += pixels[i + 1];
-        b += pixels[i + 2];
+        r += pixels[i]; g += pixels[i + 1]; b += pixels[i + 2];
         samples += 1;
       }
 
-      if (samples > 0) {
-        applyAccent(rgbToHex([r / samples, g / samples, b / samples]));
-      }
+      if (samples > 0) applyAccent(rgbToHex([r / samples, g / samples, b / samples]), true);
     } catch {
-      applyAccent(fallback);
+      applyAccent(fallback, true);
     }
   };
 
-  image.onerror = () => applyAccent(fallback);
+  image.onerror = () => applyAccent(fallback, true);
   image.src = src;
 }
 
-// -------------------------------------------------------------------------
-// Visualización (con throttling)
-// -------------------------------------------------------------------------
-function draw(now) {
-  requestAnimationFrame(draw);
-  if (!animationActive) return;
-
-  const interval = isPlaying ? DRAW_INTERVAL_PLAYING : DRAW_INTERVAL_PAUSED;
-  if (now - lastDrawTime < interval) return;
-  lastDrawTime = now;
-
-  if (isPlaying && analyser && dataArray && now - lastAnalyserTime > ANALYSER_INTERVAL) {
-    lastAnalyserTime = now;
-    analyser.getByteFrequencyData(dataArray);
-
-    // Submuestreamos el array para no recorrerlo entero.
-    let sum = 0;
-    let count = 0;
-    for (let i = 0; i < dataArray.length; i += 4) {
-      sum += dataArray[i];
-      count += 1;
-    }
-    const average = count ? sum / count / 255 : 0;
-    visualPulse = visualPulse * 0.84 + average * 0.16;
-  }
-
-  drawWave(elements.leftWave, true);
-  drawWave(elements.rightWave, false);
-  updateRealClock();
-  updateDemoClock();
-}
-
-function getCanvasSize(canvas) {
-  const rect = canvas.getBoundingClientRect();
-  const scale = window.devicePixelRatio || 1;
-  const w = Math.floor(rect.width * scale);
-  const h = Math.floor(rect.height * scale);
-
-  const cached = canvasSizes.get(canvas);
-  if (!cached || cached.w !== w || cached.h !== h) {
-    canvas.width = w;
-    canvas.height = h;
-    canvasSizes.set(canvas, { w, h });
-  }
-  return canvas;
-}
-
-function drawWave(canvas, mirror) {
-  const context = canvas.getContext("2d");
-  const w = canvas.width;
-  const h = canvas.height;
-
-  context.clearRect(0, 0, w, h);
-
-  const bars = 26; // antes 36 → menos trabajo
-  const centerX = mirror ? w * 0.9 : w * 0.1;
-  const gap = h / bars;
-  const maxWidth = w * 0.82;
-  const active = isPlaying;
-  const time = performance.now() / 720;
-
-  const accentRgb = getCssRgb("--accent-rgb");
-  const accent2Rgb = getCssRgb("--accent-two-rgb");
-
-  for (let i = 0; i < bars; i += 1) {
-    const dataIndex = dataArray
-      ? Math.min(dataArray.length - 1, Math.floor((i / bars) ** 1.55 * dataArray.length))
-      : 0;
-
-    const fakePulse = 0.32 + Math.sin(time * 1.8 + i * 0.58) * 0.16;
-
-    const dataValue = active && dataArray
-      ? Math.max(0.035, dataArray[dataIndex] / 255 + visualPulse * 0.28)
-      : active
-        ? fakePulse
-        : 0.22 + Math.sin(time + i * 0.58) * 0.08;
-
-    const barWidth = Math.max(8, maxWidth * (0.1 + dataValue * 0.9));
-    const barHeight = Math.max(2, gap * 0.36);
-    const y = i * gap + gap * 0.32;
-    const x = mirror ? centerX - barWidth : centerX;
-
-    context.fillStyle = `rgba(${mirror ? accent2Rgb : accentRgb}, ${active ? 0.85 : 0.28})`;
-    roundedRect(context, x, y, barWidth, barHeight, 999);
-    context.fill();
-  }
-}
-
-function drawSparkles(now) {
-  requestAnimationFrame(drawSparkles);
-  if (!animationActive) return;
-
-  const interval = isPlaying ? SPARK_INTERVAL_PLAYING : SPARK_INTERVAL_PAUSED;
-  if (now - lastSparkTime < interval) return;
-  lastSparkTime = now;
-
-  const canvas = elements.spark;
-  const w = canvas.width;
-  const h = canvas.height;
-
-  if (!w || !h) {
-    const rect = canvas.getBoundingClientRect();
-    const scale = window.devicePixelRatio || 1;
-    canvas.width = Math.floor(rect.width * scale);
-    canvas.height = Math.floor(rect.height * scale);
-    return;
-  }
-
-  const context = canvas.getContext("2d");
-  context.clearRect(0, 0, w, h);
-
-  const accentRgb = getCssRgb("--accent-rgb");
-
-  sparkles.forEach((sparkle) => {
-    sparkle.x += sparkle.speedX;
-    sparkle.y += sparkle.speedY;
-    sparkle.life += sparkle.speedLife;
-
-    if (
-      sparkle.x < -20 || sparkle.x > w + 20 ||
-      sparkle.y < -20 || sparkle.y > h + 20
-    ) {
-      Object.assign(sparkle, createSparkle(w, h));
-    }
-
-    const opacity = 0.16 + Math.abs(Math.sin(sparkle.life)) * 0.42;
-
-    context.beginPath();
-    context.arc(sparkle.x, sparkle.y, sparkle.radius, 0, Math.PI * 2);
-    context.fillStyle = `rgba(${accentRgb}, ${opacity})`;
-    context.fill();
-  });
-}
-
-function createSparkle(width, height) {
-  // Si nos pasan dimensiones 0 (canvas aún sin layout), usamos fallback.
-  const w = width || window.innerWidth;
-  const h = height || window.innerHeight;
-
-  return {
-    x: Math.random() * w,
-    y: Math.random() * h,
-    radius: 0.6 + Math.random() * 1.8,
-    speedX: (-0.15 + Math.random() * 0.3),
-    speedY: (-0.18 - Math.random() * 0.22),
-    life: Math.random() * Math.PI * 2,
-    speedLife: 0.012 + Math.random() * 0.025
-  };
-}
-
-// -------------------------------------------------------------------------
-// Relojes
-// -------------------------------------------------------------------------
-function updateDemoClock() {
-  const track = getTrack();
-
-  if (!track.demo || !isPlaying) return;
-
-  const duration = 100;
-  const time = getDemoTime();
-
-  if (!isSeeking) {
-    elements.seek.value = String((time / duration) * 1000);
-  }
-
-  elements.currentTime.textContent = formatTime(time);
-  elements.durationTime.textContent = formatTime(duration);
-
-  if (time >= duration) {
-    nextTrack(true);
-  }
-}
-
+// ------------------------------------------------------------------
+// Relojes (real y demo)
+// ------------------------------------------------------------------
 function updateRealClock(force = false) {
   const track = getTrack();
-
   if (track.demo || isSeeking) return;
 
   const duration = elements.audio.duration || 0;
   const currentTime = elements.audio.currentTime || 0;
-
   if (!duration) return;
 
   elements.seek.value = String((currentTime / duration) * 1000);
 
   const renderedSecond = Math.floor(currentTime);
-
   if (force || renderedSecond !== lastRenderedSecond) {
     lastRenderedSecond = renderedSecond;
     elements.currentTime.textContent = formatTime(currentTime);
@@ -1079,46 +906,56 @@ function updateRealClock(force = false) {
   }
 }
 
+function updateDemoClock() {
+  const track = getTrack();
+  if (!track.demo || !isPlaying) return;
+
+  const duration = 100;
+  const time = getDemoTime();
+
+  if (!isSeeking) elements.seek.value = String((time / duration) * 1000);
+
+  elements.currentTime.textContent = formatTime(time);
+  elements.durationTime.textContent = formatTime(duration);
+
+  if (time >= duration) nextTrack(true);
+}
+
+function startDemoLoop() {
+  if (demoRafId) return;
+  const tick = () => {
+    if (!isPlaying || !getTrack().demo) { demoRafId = 0; return; }
+    updateDemoClock();
+    demoRafId = requestAnimationFrame(tick);
+  };
+  demoRafId = requestAnimationFrame(tick);
+}
+
+function stopDemoLoop() {
+  if (demoRafId) {
+    cancelAnimationFrame(demoRafId);
+    demoRafId = 0;
+  }
+}
+
 function getDemoTime() {
-  if (visualOnlyDemo) {
-    return performance.now() / 1000 - demoStartedAt;
-  }
-
-  if (!audioContext || !isPlaying) {
-    return demoPausedAt;
-  }
-
-  return audioContext.currentTime - demoStartedAt;
+  if (!isPlaying) return demoPausedAt;
+  return performance.now() / 1000 - demoStartedAt;
 }
 
-function roundedRect(context, x, y, width, height, radius) {
-  const r = Math.min(radius, height / 2, width / 2);
-
-  context.beginPath();
-  context.moveTo(x + r, y);
-  context.arcTo(x + width, y, x + width, y + height, r);
-  context.arcTo(x + width, y + height, x, y + height, r);
-  context.arcTo(x, y + height, x, y, r);
-  context.arcTo(x, y, x + width, y, r);
-  context.closePath();
-}
-
+// ------------------------------------------------------------------
+// Formato / color helpers
+// ------------------------------------------------------------------
 function formatTime(seconds) {
   if (!Number.isFinite(seconds)) return "0:00";
-
   const mins = Math.floor(seconds / 60);
   const secs = Math.floor(seconds % 60).toString().padStart(2, "0");
-
   return `${mins}:${secs}`;
 }
 
-// -------------------------------------------------------------------------
-// Color helpers
-// -------------------------------------------------------------------------
 function hexToRgb(hex) {
   const clean = String(hex).trim().replace("#", "");
   if (!/^[a-f\d]{6}$/i.test(clean)) return null;
-
   return [
     parseInt(clean.slice(0, 2), 16),
     parseInt(clean.slice(2, 4), 16),
@@ -1140,23 +977,15 @@ function rotateColor(rgb) {
   ];
 }
 
-function getCssRgb(name) {
-  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
-}
-
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, (char) => ({
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    '"': "&quot;",
-    "'": "&#039;"
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;"
   })[char]);
 }
 
-// -------------------------------------------------------------------------
+// ------------------------------------------------------------------
 // Volumen / mute
-// -------------------------------------------------------------------------
+// ------------------------------------------------------------------
 function setupVolumeIconFallback() {
   if (!elements.volumeIconFallback || elements.mute) return;
 
@@ -1169,12 +998,6 @@ function setupVolumeIconFallback() {
   elements.volumeIconFallback.addEventListener("click", (event) => {
     event.preventDefault();
     event.stopPropagation();
-    toggleMute();
-  });
-
-  elements.volumeIconFallback.addEventListener("keydown", (event) => {
-    if (event.key !== "Enter" && event.key !== " ") return;
-    event.preventDefault();
     toggleMute();
   });
 }
@@ -1192,20 +1015,14 @@ function syncOutputVolume() {
   elements.audio.volume = outputVolume;
   elements.audio.muted = isMuted || sliderValue === 0;
 
-  if (masterGain && audioContext) {
-    masterGain.gain.setTargetAtTime(outputVolume, audioContext.currentTime, 0.025);
-  }
-
   updateMuteIcon();
 }
 
 function toggleMute() {
   isMuted = !isMuted;
-
   if (!isMuted && getVolumeValue() === 0) {
     elements.volume.value = String(lastVolume || 0.82);
   }
-
   syncOutputVolume();
 }
 
@@ -1231,16 +1048,17 @@ function updateMuteIcon() {
   }
 }
 
-// -------------------------------------------------------------------------
+// ------------------------------------------------------------------
 // Media Session metadata / position
-// -------------------------------------------------------------------------
+// ------------------------------------------------------------------
 function updateMediaSession(track) {
   if (!("mediaSession" in navigator)) return;
 
   try {
-    // Varias tallas mejoran la compatibilidad con iOS y Android Auto.
     const artUrl = new URL(track.cover || defaultCover, window.location.href).href;
     const artType = getArtworkType(track.cover);
+
+    // Varios tamaños = mejor compatibilidad iOS / Android Auto
     const artwork = [
       { src: artUrl, sizes: "96x96", type: artType },
       { src: artUrl, sizes: "128x128", type: artType },
@@ -1257,17 +1075,24 @@ function updateMediaSession(track) {
       artwork
     });
 
-    updateMediaPosition();
+    updateMediaPosition(true);
   } catch {
     // opcional
   }
 }
 
-function updateMediaPosition() {
-  if (!("mediaSession" in navigator) || typeof navigator.mediaSession.setPositionState !== "function") return;
+function updateMediaPosition(force = false) {
+  if (!("mediaSession" in navigator)) return;
+  if (typeof navigator.mediaSession.setPositionState !== "function") return;
+
+  // Throttle a 1/s: cada setPositionState re-renderiza el lock screen
+  const now = performance.now();
+  if (!force && now - lastPositionUpdate < 1000) return;
+  lastPositionUpdate = now;
 
   const track = getTrack();
-  if (track.demo || !Number.isFinite(elements.audio.duration) || elements.audio.duration <= 0) return;
+  if (track.demo) return;
+  if (!Number.isFinite(elements.audio.duration) || elements.audio.duration <= 0) return;
 
   try {
     navigator.mediaSession.setPositionState({
@@ -1287,25 +1112,38 @@ function getArtworkType(src) {
   return "image/jpeg";
 }
 
-// -------------------------------------------------------------------------
-// Interacción / eventos
-// -------------------------------------------------------------------------
-function togglePlay() {
-  if (isPlaying) {
-    pauseCurrent();
-  } else {
-    playCurrent().catch(() => {
-      elements.status.textContent = "El navegador ha bloqueado el audio por ahora.";
-      updatePlayState(false);
-    });
-  }
+// ------------------------------------------------------------------
+// Precarga del siguiente track (solo cerca del final)
+// ------------------------------------------------------------------
+function preloadNextTrack() {
+  const next = getTrack(getNextIndex());
+  if (!next.src) return;
+  if (preloadedLink && preloadedLink.href.endsWith(encodeURI(next.src))) return;
+
+  preloadedLink?.remove();
+  preloadedLink = document.createElement("link");
+  preloadedLink.rel = "preload";
+  preloadedLink.as = "audio";
+  preloadedLink.href = next.src;
+  document.head.appendChild(preloadedLink);
 }
 
+// ------------------------------------------------------------------
+// Interacción
+// ------------------------------------------------------------------
+function togglePlay() {
+  if (isPlaying) pauseCurrent();
+  else playCurrent().catch(() => {
+    elements.status.textContent = "El navegador ha bloqueado el audio por ahora.";
+    updatePlayState(false);
+  });
+}
+
+let lastPointerToggleAt = 0;
 elements.play.addEventListener("pointerup", () => {
   lastPointerToggleAt = performance.now();
   togglePlay();
 });
-
 elements.play.addEventListener("click", () => {
   if (performance.now() - lastPointerToggleAt < 350) return;
   togglePlay();
@@ -1326,17 +1164,25 @@ elements.audio.addEventListener("pause", () => {
   if (!getTrack().demo) updatePlayState(false);
 });
 
-elements.audio.addEventListener("ended", () => nextTrack(true));
+elements.audio.addEventListener("ended", () => {
+  // Sin transición al terminar: la siguiente canción debe empezar ya
+  loadTrackInternal(getNextIndex(), true);
+});
 
 elements.audio.addEventListener("loadedmetadata", () => {
   elements.durationTime.textContent = formatTime(elements.audio.duration);
-  updateMediaPosition();
+  updateMediaPosition(true);
 });
 
 elements.audio.addEventListener("timeupdate", () => {
   if (isSeeking || getTrack().demo) return;
   updateRealClock(true);
   updateMediaPosition();
+
+  // Precarga cuando quedan menos de 20s
+  const dur = elements.audio.duration || 0;
+  const cur = elements.audio.currentTime || 0;
+  if (dur && dur - cur < 20) preloadNextTrack();
 });
 
 elements.audio.addEventListener("error", () => {
@@ -1347,7 +1193,6 @@ elements.audio.addEventListener("error", () => {
 
 elements.seek.addEventListener("input", () => {
   isSeeking = true;
-
   const track = getTrack();
 
   if (track.demo) {
@@ -1364,10 +1209,7 @@ elements.seek.addEventListener("change", () => {
 
   if (track.demo) {
     demoPausedAt = (Number(elements.seek.value) / 1000) * 100;
-
-    if (isPlaying && audioContext) {
-      demoStartedAt = audioContext.currentTime - demoPausedAt;
-    }
+    if (isPlaying) demoStartedAt = performance.now() / 1000 - demoPausedAt;
   } else if (elements.audio.duration) {
     elements.audio.currentTime = (Number(elements.seek.value) / 1000) * elements.audio.duration;
   }
@@ -1377,16 +1219,8 @@ elements.seek.addEventListener("change", () => {
 
 elements.volume.addEventListener("input", () => {
   const value = getVolumeValue();
-
-  if (value > 0) {
-    lastVolume = value;
-    isMuted = false;
-  }
-
-  if (value === 0) {
-    isMuted = true;
-  }
-
+  if (value > 0) { lastVolume = value; isMuted = false; }
+  if (value === 0) { isMuted = true; }
   syncOutputVolume();
 });
 
@@ -1397,5 +1231,63 @@ elements.shuffle.addEventListener("click", () => {
   elements.shuffle.classList.toggle("is-active", shuffle);
 });
 
-// Arrancar
+// ------------------------------------------------------------------
+// Atajos de teclado (escritorio)
+// ------------------------------------------------------------------
+function setupKeyboardShortcuts() {
+  document.addEventListener("keydown", (event) => {
+    const tag = event.target.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA") return;
+
+    switch (event.code) {
+      case "Space":
+        event.preventDefault();
+        togglePlay();
+        break;
+      case "ArrowRight":
+        nextTrack(true);
+        break;
+      case "ArrowLeft":
+        previousTrack(true);
+        break;
+      case "ArrowUp":
+        event.preventDefault();
+        elements.volume.value = String(Math.min(1, getVolumeValue() + 0.05));
+        lastVolume = getVolumeValue();
+        syncOutputVolume();
+        break;
+      case "ArrowDown":
+        event.preventDefault();
+        elements.volume.value = String(Math.max(0, getVolumeValue() - 0.05));
+        lastVolume = getVolumeValue();
+        syncOutputVolume();
+        break;
+      case "KeyM":
+        toggleMute();
+        break;
+      case "KeyS":
+        shuffle = !shuffle;
+        elements.shuffle.classList.toggle("is-active", shuffle);
+        break;
+    }
+  });
+}
+
+// ------------------------------------------------------------------
+// Service Worker
+// ------------------------------------------------------------------
+function registerServiceWorker() {
+  if (!("serviceWorker" in navigator)) return;
+  // Solo en https o localhost (no en file://)
+  if (location.protocol !== "https:" && location.hostname !== "localhost" && location.hostname !== "127.0.0.1") return;
+
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("sw.js").catch(() => {});
+  });
+}
+
+// ------------------------------------------------------------------
+// Init
+// ------------------------------------------------------------------
+setupVolumeIconFallback();
 boot();

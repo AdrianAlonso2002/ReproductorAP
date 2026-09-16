@@ -3,21 +3,32 @@
 
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#07050c" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Reproductor AP" />
+  <meta name="format-detection" content="telephone=no" />
   <title>Reproductor AP</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link rel="shortcut icon" href="assets/reprod.png" type="image/x-icon">
-  <link rel="apple-touch-icon" href="assets/reprod.png">
-  <audio id="audioElement" preload="metadata" crossorigin="anonymous"></audio>
-  <link rel="manifest" href="manifest.json">
+  <link rel="shortcut icon" href="assets/reprod.png" type="image/png" />
+  <link rel="apple-touch-icon" sizes="180x180" href="assets/reprod.png" />
+  <link rel="apple-touch-icon" sizes="192x192" href="assets/reprod.png" />
+  <link rel="apple-touch-icon" sizes="512x512" href="assets/reprod.png" />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="styles.css?v=9" />
+  <link rel="stylesheet" href="styles.css?v=10" />
 </head>
 
 <body>
+  <div id="loadingScreen" class="loading-screen" role="status" aria-live="polite">
+  <div class="loading-content">
+    <div class="loading-spinner" aria-hidden="true"></div>
+    <p class="loading-text">Reproductor AP cargando para Bebita</p>
+  </div>
+</div>
   <div class="ambient" aria-hidden="true">
-    <canvas id="sparkCanvas"></canvas>
+    <div class="spark-field"></div>
     <div class="color-orbit color-orbit-a"></div>
     <div class="color-orbit color-orbit-b"></div>
     <div class="noise"></div>
@@ -41,12 +52,12 @@
       </div>
 
       <div class="visual-area">
-        <canvas id="leftWave" class="wave-canvas" aria-hidden="true"></canvas>
+        <div class="wave-bars wave-bars--left" aria-hidden="true"></div>
         <div class="cover-wrap">
-          <img id="coverArt" src="assets/default-cover.png" alt="Portada de la cancion" />
+          <img id="coverArt" src="assets/default-cover.png" alt="Portada de la cancion" decoding="async" />
           <div class="cover-shine" aria-hidden="true"></div>
         </div>
-        <canvas id="rightWave" class="wave-canvas" aria-hidden="true"></canvas>
+        <div class="wave-bars wave-bars--right" aria-hidden="true"></div>
       </div>
 
       <div class="track-meta">
@@ -114,7 +125,7 @@
       </div>
       <div class="song-detail">
         <div class="detail-cover">
-          <img id="detailCover" src="assets/default-cover.png" alt="" />
+          <img id="detailCover" src="assets/default-cover.png" alt="" decoding="async" />
         </div>
         <p class="detail-kicker" id="detailArtist">Aura System</p>
         <h2 id="detailTitle">Midnight Bloom</h2>
@@ -141,9 +152,9 @@
     </aside>
   </main>
 
-  <audio id="audioElement" preload="auto"></audio>
-  <script src="tracks.js?v=9"></script>
-  <script src="script.js?v=9"></script>
+  <audio id="audioElement" preload="metadata" playsinline webkit-playsinline></audio>
+  <script src="tracks.js?v=10"></script>
+  <script src="script.js?v=10"></script>
 </body>
 
 </html>
