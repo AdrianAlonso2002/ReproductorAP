@@ -5,13 +5,13 @@
    - CANCIONES: NO se interceptan nunca (el navegador gestiona Range/streaming)
 */
 
-const CACHE_VERSION = "reprodap-v11";
+const CACHE_VERSION = "reprodap-v12";
 const APP_SHELL = [
   "./",
   "./index.html",
-  "./styles.css?v=11",
-  "./script.js?v=11",
-  "./tracks.js?v=11",
+  "./styles.css?v=12",
+  "./script.js?v=12",
+  "./tracks.js?v=12",
   "./manifest.json",
   "./assets/reprod.png",
   "./assets/default-cover.png"

@@ -68,13 +68,9 @@ const metadataCache = new Map();
 // Arranque
 // ------------------------------------------------------------------
 function boot() {
-  // Manifest solo en http(s) — evita el error de CORS en file://
-  if (location.protocol === "http:" || location.protocol === "https:") {
-    const link = document.createElement("link");
-    link.rel = "manifest";
-    link.href = "manifest.json";
-    document.head.appendChild(link);
-  }
+  // Ordenar playlist por fecha desde el primer instante
+  playlist.sort((a, b) => getDateScore(b) - getDateScore(a));
+
   buildWaveBars();
   buildSparkles();
 
@@ -85,16 +81,16 @@ function boot() {
 
   renderLibrary();
   loadTrack(0, false);
-  hydrateAllTrackMetadata();
 
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible" && isPlaying) {
-      // Por si iOS libera el audio al volver del background
+    const isHidden = document.hidden;
+    document.body.classList.toggle("is-tab-hidden", isHidden);
+
+    if (!isHidden && isPlaying) {
+      // Al volver del background refrescamos handlers y recuperamos estado de pantalla
       if (!getTrack().demo && elements.audio.paused) {
-        // No forzamos play (iOS podría bloquear); solo refrescamos handlers
         refreshMediaSessionHandlers();
       }
-      // Reanudar loop demo si hacía falta
       if (getTrack().demo && isPlaying) startDemoLoop();
     }
   });
@@ -188,8 +184,8 @@ function setupMediaSession() {
   safeSetHandler("play", () => playCurrent().catch(handlePlayError));
   safeSetHandler("pause", pauseCurrent);
   safeSetHandler("stop", pauseCurrent);
-  safeSetHandler("previoustrack", () => previousTrack(true));
-  safeSetHandler("nexttrack", () => nextTrack(true));
+  safeSetHandler("previoustrack", () => previousTrack(true, true));
+  safeSetHandler("nexttrack", () => nextTrack(true, true));
 
   safeSetHandler("seekto", (details) => {
     if (!Number.isFinite(details.seekTime) || getTrack().demo) return;
@@ -211,8 +207,8 @@ function refreshMediaSessionHandlers() {
   if (!("mediaSession" in navigator)) return;
   safeSetHandler("play", () => playCurrent().catch(handlePlayError));
   safeSetHandler("pause", pauseCurrent);
-  safeSetHandler("previoustrack", () => previousTrack(true));
-  safeSetHandler("nexttrack", () => nextTrack(true));
+  safeSetHandler("previoustrack", () => previousTrack(true, true));
+  safeSetHandler("nexttrack", () => nextTrack(true, true));
   safeSetHandler("seekto", (details) => {
     if (!Number.isFinite(details.seekTime) || getTrack().demo) return;
     elements.audio.currentTime = details.seekTime;
@@ -310,14 +306,17 @@ function loadTrackInternal(index, autoplay, { instantAccent = false } = {}) {
 
   stopDemoLoop();
 
-  // Reset explícito: imprescindible en iOS para no arrastrar estado anterior
-  elements.audio.pause();
-  elements.audio.removeAttribute("src");
-  elements.audio.load();
-
-  // Asignar la nueva fuente solo si es real
+  // En iOS, cambiar el src directamente preserva la sesión de audio activa (AVAudioSession).
+  // Eliminar el src o llamar a load() sin fuente destruye la sesión y bloquea la reproducción continua en segundo plano.
   if (!track.demo) {
-    elements.audio.src = track.src;
+    const targetSrc = track.src;
+    if (!elements.audio.src.endsWith(encodeURI(targetSrc)) && elements.audio.src !== targetSrc) {
+      elements.audio.src = targetSrc;
+    }
+  } else {
+    elements.audio.pause();
+    elements.audio.removeAttribute("src");
+    elements.audio.load();
   }
 
   elements.title.textContent = track.title;
@@ -340,8 +339,10 @@ function loadTrackInternal(index, autoplay, { instantAccent = false } = {}) {
   setActiveCards();
   renderDetails(track);
 
-  extractPalette(track.cover, track.color);
-  hydrateTrackMetadata(currentIndex);
+  // Ahorro de batería y fluidez: si la pantalla está apagada / pestaña oculta, no calculamos canvas
+  if (!document.hidden) {
+    extractPalette(track.cover, track.color);
+  }
 
   // CRUCIAL: re-registrar handlers tras cada cambio de src
   refreshMediaSessionHandlers();
@@ -351,17 +352,20 @@ function loadTrackInternal(index, autoplay, { instantAccent = false } = {}) {
   }
 }
 
-function loadTrack(index, autoplay, { silent = false } = {}) {
+function loadTrack(index, autoplay, { silent = false, instant = false } = {}) {
   if (transitionTimer) {
     clearTimeout(transitionTimer);
     transitionTimer = null;
   }
 
-  const skipTransition = isFirstLoad || silent;
+  // Si la pantalla está bloqueada o en segundo plano, o instant = true:
+  // NUNCA usar setTimeout ni transiciones visuales porque iOS congela los timers en reposo
+  const isHidden = document.hidden || document.visibilityState === "hidden";
+  const skipTransition = isFirstLoad || silent || instant || isHidden;
   const stage = document.querySelector(".player-stage");
   const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-  // Sin transición: primera carga, silencioso, sin stage, o reduced-motion
+  // Sin transición: primera carga, silencioso, instantáneo, background (iOS) o reduced-motion
   if (skipTransition || !stage || reduced) {
     isFirstLoad = false;
     loadTrackInternal(index, autoplay, { instantAccent: skipTransition });
@@ -403,7 +407,7 @@ function renderDetails(track) {
   updateMediaSession(track);
 }
 
-async function playCurrent() {
+async function playCurrent(retryCount = 0) {
   const track = getTrack();
 
   if (track.demo) {
@@ -421,13 +425,18 @@ async function playCurrent() {
 
     await elements.audio.play();
 
+    isChangingTrack = false;
     updatePlayState(true);
     elements.status.textContent = "";
 
     // Justo después de arrancar: volver a colocar handlers (iOS)
     refreshMediaSessionHandlers();
-    } catch (err) {
-    console.error("[playCurrent]", err?.name, err?.message);
+  } catch (err) {
+    console.warn("[playCurrent]", err?.name, err?.message);
+    if (retryCount < 2 && isPlaying) {
+      setTimeout(() => playCurrent(retryCount + 1), 250);
+      return;
+    }
     handlePlayError();
   }
 }
@@ -468,14 +477,14 @@ function updatePlayState(nextState) {
   }
 }
 
-function nextTrack(autoplay = isPlaying) {
+function nextTrack(autoplay = isPlaying, instant = false) {
   const shouldAutoplay = typeof autoplay === "boolean" ? autoplay : isPlaying;
-  loadTrack(getNextIndex(), shouldAutoplay);
+  loadTrack(getNextIndex(), shouldAutoplay, { instant: instant || document.hidden });
 }
 
-function previousTrack(autoplay = isPlaying) {
+function previousTrack(autoplay = isPlaying, instant = false) {
   const shouldAutoplay = typeof autoplay === "boolean" ? autoplay : isPlaying;
-  loadTrack(currentIndex - 1, shouldAutoplay);
+  loadTrack(currentIndex - 1, shouldAutoplay, { instant: instant || document.hidden });
 }
 
 function getNextIndex() {
@@ -847,7 +856,19 @@ function applyAccent(hex, animate = false) {
   tweenAccent(hex, 600);
 }
 
+const paletteCache = new Map();
+
 function extractPalette(src, fallback) {
+  if (!src) return applyAccent(fallback, true);
+  if (paletteCache.has(src)) {
+    return applyAccent(paletteCache.get(src), true);
+  }
+
+  // Ahorro de CPU y batería: si la pestaña no es visible, saltarse el procesamiento en canvas
+  if (document.hidden) {
+    return applyAccent(fallback, true);
+  }
+
   const image = new Image();
   // Sin crossOrigin: todo es same-origin y esto evita conflictos con el SW
   image.decoding = "async";
@@ -875,7 +896,14 @@ function extractPalette(src, fallback) {
         samples += 1;
       }
 
-      if (samples > 0) applyAccent(rgbToHex([r / samples, g / samples, b / samples]), true);
+      if (samples > 0) {
+        const hex = rgbToHex([r / samples, g / samples, b / samples]);
+        paletteCache.set(src, hex);
+        applyAccent(hex, true);
+      } else {
+        paletteCache.set(src, fallback);
+        applyAccent(fallback, true);
+      }
     } catch {
       applyAccent(fallback, true);
     }
@@ -1113,19 +1141,18 @@ function getArtworkType(src) {
 }
 
 // ------------------------------------------------------------------
-// Precarga del siguiente track (solo cerca del final)
+// Precarga del siguiente track
 // ------------------------------------------------------------------
+let preloadedSrc = "";
 function preloadNextTrack() {
   const next = getTrack(getNextIndex());
-  if (!next.src) return;
-  if (preloadedLink && preloadedLink.href.endsWith(encodeURI(next.src))) return;
+  if (!next.src || next.src === preloadedSrc) return;
+  preloadedSrc = next.src;
 
-  preloadedLink?.remove();
-  preloadedLink = document.createElement("link");
-  preloadedLink.rel = "preload";
-  preloadedLink.as = "audio";
-  preloadedLink.href = next.src;
-  document.head.appendChild(preloadedLink);
+  const preloader = document.getElementById("preloaderAudio");
+  if (preloader) {
+    preloader.src = next.src;
+  }
 }
 
 // ------------------------------------------------------------------
@@ -1164,10 +1191,16 @@ elements.audio.addEventListener("pause", () => {
   if (!getTrack().demo) updatePlayState(false);
 });
 
-elements.audio.addEventListener("ended", () => {
-  // Sin transición al terminar: la siguiente canción debe empezar ya
-  loadTrackInternal(getNextIndex(), true);
-});
+let isChangingTrack = false;
+
+function onTrackEnded() {
+  if (isChangingTrack) return;
+  isChangingTrack = true;
+  // Sin retrasos: cambio instantáneo para mantener activa la sesión AVAudioSession en iOS
+  nextTrack(true, true);
+}
+
+elements.audio.addEventListener("ended", onTrackEnded);
 
 elements.audio.addEventListener("loadedmetadata", () => {
   elements.durationTime.textContent = formatTime(elements.audio.duration);
@@ -1179,15 +1212,29 @@ elements.audio.addEventListener("timeupdate", () => {
   updateRealClock(true);
   updateMediaPosition();
 
-  // Precarga cuando quedan menos de 20s
   const dur = elements.audio.duration || 0;
   const cur = elements.audio.currentTime || 0;
-  if (dur && dur - cur < 20) preloadNextTrack();
+
+  // En iOS, si el teléfono entra en reposo profundo, el evento 'ended' a veces no se despacha.
+  // Anticipamos el cambio si queda menos de 0.25s para asegurar continuidad.
+  if (dur > 0 && cur > 0 && dur - cur <= 0.25 && !elements.audio.paused && !isChangingTrack) {
+    onTrackEnded();
+    return;
+  }
+
+  // Precarga fluida del siguiente track cuando quedan menos de 25s
+  if (dur && dur - cur < 25) preloadNextTrack();
 });
 
 elements.audio.addEventListener("error", () => {
   if (!getTrack().demo) {
-    elements.status.textContent = "Ese archivo no carga todavía. Comprueba nombre y carpeta.";
+    console.warn("Audio element error:", elements.audio.error);
+    if (isPlaying) {
+      // Si la reproducción falla (ej. caída momentánea de red), salta a la siguiente canción
+      setTimeout(() => nextTrack(true, true), 1000);
+    } else {
+      elements.status.textContent = "Ese archivo no carga todavía. Comprueba nombre y carpeta.";
+    }
   }
 });
 
@@ -1281,9 +1328,15 @@ function registerServiceWorker() {
   // Solo en https o localhost (no en file://)
   if (location.protocol !== "https:" && location.hostname !== "localhost" && location.hostname !== "127.0.0.1") return;
 
-  window.addEventListener("load", () => {
-    navigator.serviceWorker.register("sw.js").catch(() => {});
-  });
+  const doRegister = () => {
+    navigator.serviceWorker.register("./sw.js", { scope: "./" }).catch(() => {});
+  };
+
+  if (document.readyState === "complete") {
+    doRegister();
+  } else {
+    window.addEventListener("load", doRegister);
+  }
 }
 
 // ------------------------------------------------------------------

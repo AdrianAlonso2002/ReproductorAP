@@ -11,6 +11,8 @@
   <meta name="apple-mobile-web-app-title" content="Reproductor AP" />
   <meta name="format-detection" content="telephone=no" />
   <title>Reproductor AP</title>
+  <link rel="canonical" href="https://adrianalonso2002.github.io/ReproductorAP/" />
+  <link rel="manifest" href="manifest.json" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="shortcut icon" href="assets/reprod.png" type="image/png" />
@@ -18,7 +20,7 @@
   <link rel="apple-touch-icon" sizes="192x192" href="assets/reprod.png" />
   <link rel="apple-touch-icon" sizes="512x512" href="assets/reprod.png" />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="styles.css?v=10" />
+  <link rel="stylesheet" href="styles.css?v=12" />
 </head>
 
 <body>
@@ -153,9 +155,10 @@
     </aside>
   </main>
 
-  <audio id="audioElement" preload="metadata" playsinline webkit-playsinline></audio>
-  <script src="tracks.js?v=10"></script>
-  <script src="script.js?v=10"></script>
+  <audio id="audioElement" preload="auto" playsinline webkit-playsinline></audio>
+  <audio id="preloaderAudio" preload="auto" playsinline muted style="display:none"></audio>
+  <script src="tracks.js?v=12"></script>
+  <script src="script.js?v=12"></script>
 </body>
 
 </html>

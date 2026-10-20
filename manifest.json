@@ -1,9 +1,10 @@
 {
+  "id": "https://adrianalonso2002.github.io/ReproductorAP/",
   "name": "ReproductorAP",
   "short_name": "ReproductorAP",
   "description": "Reproductor de música privado",
   "start_url": "https://adrianalonso2002.github.io/ReproductorAP/",
-  "scope": "/ReproductorAP/",
+  "scope": "https://adrianalonso2002.github.io/ReproductorAP/",
   "display": "standalone",
   "display_override": ["standalone", "minimal-ui"],
   "orientation": "portrait",

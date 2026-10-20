@@ -888,3 +888,15 @@ input[type="range"] {
   .loading-spinner { animation-duration: 1.4s; }
   .loading-text { animation: none; opacity: 1; }
 }
+
+/* ================================================================== */
+/*  Ahorro de batería en segundo plano / pantalla bloqueada           */
+/* ================================================================== */
+body.is-tab-hidden .spark-field span,
+body.is-tab-hidden .color-orbit,
+body.is-tab-hidden .wave-bars span,
+body.is-tab-hidden .cover-shine,
+body.is-tab-hidden .cover-wrap {
+  animation-play-state: paused !important;
+  transition: none !important;
+}
