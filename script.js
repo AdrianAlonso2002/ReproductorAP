@@ -45,6 +45,8 @@ const elements = {
 
 let currentIndex = 0;
 let isPlaying = false;
+let isPlayRequested = false;
+let isPlayPending = false;
 let isSeeking = false;
 let shuffle = false;
 let hasUserSelectedTrack = false;
@@ -86,9 +88,22 @@ function boot() {
     const isHidden = document.hidden;
     document.body.classList.toggle("is-tab-hidden", isHidden);
 
-    if (!isHidden && isPlaying) {
-      // Al volver del background refrescamos handlers y recuperamos estado de pantalla
-      if (!getTrack().demo && elements.audio.paused) {
+    if (isHidden) {
+      // Si el usuario sale de la app mientras la canción está cargando para sonar:
+      // Mantener la sesión de MediaSession como "playing" para que iOS mantenga activa la descarga
+      if (isPlayRequested && !getTrack().demo) {
+        if ("mediaSession" in navigator) {
+          try {
+            navigator.mediaSession.playbackState = "playing";
+          } catch {}
+        }
+      }
+    } else {
+      // Al volver del background
+      if (isPlayRequested && elements.audio.paused && !getTrack().demo && !isPlayPending) {
+        playCurrent().catch(() => {});
+      }
+      if (!getTrack().demo && isPlaying) {
         refreshMediaSessionHandlers();
       }
       if (getTrack().demo && isPlaying) startDemoLoop();
@@ -181,7 +196,10 @@ function setupMediaSession() {
   if (!("mediaSession" in navigator)) return;
 
   // Cada handler va aislado: un fallo no rompe el resto
-  safeSetHandler("play", () => playCurrent().catch(handlePlayError));
+  safeSetHandler("play", () => {
+    isPlayRequested = true;
+    playCurrent().catch(handlePlayError);
+  });
   safeSetHandler("pause", pauseCurrent);
   safeSetHandler("stop", pauseCurrent);
   safeSetHandler("previoustrack", () => previousTrack(true, true));
@@ -205,7 +223,10 @@ function setupMediaSession() {
  */
 function refreshMediaSessionHandlers() {
   if (!("mediaSession" in navigator)) return;
-  safeSetHandler("play", () => playCurrent().catch(handlePlayError));
+  safeSetHandler("play", () => {
+    isPlayRequested = true;
+    playCurrent().catch(handlePlayError);
+  });
   safeSetHandler("pause", pauseCurrent);
   safeSetHandler("previoustrack", () => previousTrack(true, true));
   safeSetHandler("nexttrack", () => nextTrack(true, true));
@@ -331,10 +352,17 @@ function loadTrackInternal(index, autoplay, { instantAccent = false } = {}) {
   lastRenderedSecond = -1;
   elements.currentTime.textContent = "0:00";
   elements.durationTime.textContent = track.demo ? "1:40" : "0:00";
-  elements.status.textContent = track.demo ? "Demo sintética lista" : "";
-  elements.play.title = "Play";
+  elements.status.textContent = autoplay ? "Cargando audio..." : (track.demo ? "Demo sintética lista" : "");
+  elements.play.title = autoplay ? "Pausa" : "Play";
 
-  updatePlayState(false);
+  if (autoplay) {
+    isPlayRequested = true;
+    updatePlayState(true);
+  } else {
+    isPlayRequested = false;
+    updatePlayState(false);
+  }
+
   applyAccent(track.color, !instantAccent);
   setActiveCards();
   renderDetails(track);
@@ -358,37 +386,30 @@ function loadTrack(index, autoplay, { silent = false, instant = false } = {}) {
     transitionTimer = null;
   }
 
-  // Si la pantalla está bloqueada o en segundo plano, o instant = true:
-  // NUNCA usar setTimeout ni transiciones visuales porque iOS congela los timers en reposo
+  // 1. EL AUDIO EMPIEZA A CARGAR Y REPRODUCIRSE INMEDIATAMENTE (0ms)
+  // El cambio de pista y la llamada a play() se ejecutan síncronamente en el gesto táctil del usuario.
+  // Así, si el usuario sale de la app o bloquea el móvil justo después de pulsar, la descarga
+  // y la sesión de audio ya están activadas en iOS sin depender de timers congelados.
+  loadTrackInternal(index, autoplay, { instantAccent: silent || instant });
+
+  // 2. Transición visual paralela de la interfaz (solo si la pantalla está visible)
   const isHidden = document.hidden || document.visibilityState === "hidden";
-  const skipTransition = isFirstLoad || silent || instant || isHidden;
   const stage = document.querySelector(".player-stage");
   const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-  // Sin transición: primera carga, silencioso, instantáneo, background (iOS) o reduced-motion
-  if (skipTransition || !stage || reduced) {
-    isFirstLoad = false;
-    loadTrackInternal(index, autoplay, { instantAccent: skipTransition });
-    return;
-  }
-
-  // 1) Fade out
-  stage.classList.remove("is-entering");
-  stage.classList.add("is-changing");
-
-  // 2) En el punto medio: cambiar la canción
-  transitionTimer = setTimeout(() => {
-    transitionTimer = null;
-
-    loadTrackInternal(index, autoplay, { instantAccent: false });
-
-    // 3) Fade in con "pop"
+  if (stage && !silent && !instant && !isHidden && !reduced && !isFirstLoad) {
     stage.classList.remove("is-changing");
+    stage.classList.remove("is-entering");
     void stage.offsetWidth;
     stage.classList.add("is-entering");
 
-    setTimeout(() => stage.classList.remove("is-entering"), 400);
-  }, TRANSITION_MS);
+    transitionTimer = setTimeout(() => {
+      transitionTimer = null;
+      stage.classList.remove("is-entering");
+    }, 400);
+  }
+
+  isFirstLoad = false;
 }
 
 function renderDetails(track) {
@@ -419,12 +440,27 @@ async function playCurrent(retryCount = 0) {
     return;
   }
 
+  isPlayRequested = true;
+  elements.status.textContent = "Cargando audio...";
+
+  // Marcar en MediaSession de inmediato que la intención es reproducir
+  // para que iOS mantenga la prioridad de red en segundo plano mientras buferiza
+  if ("mediaSession" in navigator) {
+    try {
+      navigator.mediaSession.playbackState = "playing";
+    } catch {}
+  }
+
+  if (isPlayPending) return;
+  isPlayPending = true;
+
   try {
     elements.audio.muted = isMuted;
     elements.audio.volume = isMuted ? 0 : getVolumeValue();
 
     await elements.audio.play();
 
+    isPlayPending = false;
     isChangingTrack = false;
     updatePlayState(true);
     elements.status.textContent = "";
@@ -432,11 +468,26 @@ async function playCurrent(retryCount = 0) {
     // Justo después de arrancar: volver a colocar handlers (iOS)
     refreshMediaSessionHandlers();
   } catch (err) {
+    isPlayPending = false;
     console.warn("[playCurrent]", err?.name, err?.message);
-    if (retryCount < 2 && isPlaying) {
-      setTimeout(() => playCurrent(retryCount + 1), 250);
+
+    // Si el usuario pausó explícitamente mientras cargaba, respetamos su pausa
+    if (!isPlayRequested) return;
+
+    // AbortError / NotAllowedError típicamente ocurren en iOS si el usuario bloquea el móvil
+    // o cambia de app mientras el buffer se está descargando.
+    // NO marcamos error fatal: dejamos que el buffer continúe y el evento 'canplay'
+    // iniciará la reproducción en cuanto haya datos suficientes.
+    if (err?.name === "AbortError" || err?.name === "NotAllowedError") {
+      elements.status.textContent = "Cargando en segundo plano...";
       return;
     }
+
+    if (retryCount < 3 && isPlayRequested) {
+      setTimeout(() => playCurrent(retryCount + 1), 350);
+      return;
+    }
+
     handlePlayError();
   }
 }
@@ -447,6 +498,8 @@ function handlePlayError() {
 }
 
 function pauseCurrent() {
+  isPlayRequested = false;
+  isPlayPending = false;
   if (getTrack().demo) {
     demoPausedAt = getDemoTime();
     stopDemoLoop();
@@ -1159,11 +1212,14 @@ function preloadNextTrack() {
 // Interacción
 // ------------------------------------------------------------------
 function togglePlay() {
-  if (isPlaying) pauseCurrent();
-  else playCurrent().catch(() => {
-    elements.status.textContent = "El navegador ha bloqueado el audio por ahora.";
-    updatePlayState(false);
-  });
+  if (isPlaying || isPlayRequested) {
+    pauseCurrent();
+  } else {
+    playCurrent().catch(() => {
+      elements.status.textContent = "El navegador ha bloqueado el audio por ahora.";
+      updatePlayState(false);
+    });
+  }
 }
 
 let lastPointerToggleAt = 0;
@@ -1185,10 +1241,39 @@ elements.library.addEventListener("click", (event) => {
   selectTrack(Number(card.dataset.index), true);
 });
 
-elements.audio.addEventListener("play", () => updatePlayState(true));
+elements.audio.addEventListener("play", () => {
+  isPlayRequested = true;
+  updatePlayState(true);
+});
+
+elements.audio.addEventListener("playing", () => {
+  isChangingTrack = false;
+  isPlayPending = false;
+  updatePlayState(true);
+  elements.status.textContent = "";
+});
+
+elements.audio.addEventListener("waiting", () => {
+  if (isPlayRequested) {
+    elements.status.textContent = "Cargando audio...";
+    if ("mediaSession" in navigator) {
+      try {
+        navigator.mediaSession.playbackState = "playing";
+      } catch {}
+    }
+  }
+});
+
+elements.audio.addEventListener("canplay", () => {
+  if (isPlayRequested && elements.audio.paused && !getTrack().demo && !isPlayPending) {
+    playCurrent().catch(() => {});
+  }
+});
 
 elements.audio.addEventListener("pause", () => {
-  if (!getTrack().demo) updatePlayState(false);
+  if (!getTrack().demo && !isPlayRequested) {
+    updatePlayState(false);
+  }
 });
 
 let isChangingTrack = false;
